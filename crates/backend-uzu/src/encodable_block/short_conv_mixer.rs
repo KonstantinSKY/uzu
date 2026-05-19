@@ -7,7 +7,7 @@ use crate::{
         Allocation, Backend, Encoder, Kernels,
         kernel::{ShortConvDecodeKernel, ShortConvPackKernel, ShortConvPrefillKernel, ShortConvTrieKernel},
     },
-    config::ShortConvConfig,
+    config::token_mixer::short_conv::ShortConvConfig,
     encodable_block::linear::{Linear, LinearBlockError},
     forward_pass::short_conv_layer::ShortConvLayer,
     parameters::{ParameterLoaderError, ParameterTree},
@@ -53,6 +53,8 @@ impl<B: Backend> ShortConvMixer<B> {
         short_conv_config: ShortConvConfig,
         model_dim: usize,
         decoder_layer_loader: &ParameterTree<B::Context>,
+        data_type: DataType,
+        weights_data_type: DataType,
     ) -> Result<(Self, Option<Allocation<B>>), ShortConvMixerError<B>> {
         if short_conv_config.kernel_size < 2 {
             return Err(ShortConvMixerError::UnsupportedConfiguration(format!(
@@ -64,29 +66,25 @@ impl<B: Backend> ShortConvMixer<B> {
         let mixer_tree = decoder_layer_loader.subtree("mixer")?;
         let conv_tree = mixer_tree.subtree("conv")?;
 
-        let data_type: DataType = short_conv_config.in_projection_config.activation_precision().into();
-
         let (in_projection, in_proj_input_hadamard_factors) = <dyn Linear<B>>::new_extracting_input_hadamard(
-            &short_conv_config.in_projection_config,
             model_dim,
             [model_dim * 3],
             context,
+            weights_data_type,
             &mixer_tree.subtree("in_projection")?,
         )
         .map_err(|err| ShortConvMixerError::LinearError(Box::new(err)))?;
 
-        let out_projection = <dyn Linear<B>>::new(
-            &short_conv_config.out_projection_config,
-            model_dim,
-            [model_dim],
-            context,
-            &mixer_tree.subtree("out_projection")?,
-        )
-        .map_err(|err| ShortConvMixerError::LinearError(Box::new(err)))?;
+        let out_projection =
+            <dyn Linear<B>>::new(model_dim, [model_dim], context, weights_data_type, &mixer_tree.subtree("out_projection")?)
+                .map_err(|err| ShortConvMixerError::LinearError(Box::new(err)))?;
 
-        let conv_weight = conv_tree.leaf("weights")?.read_allocation()?;
+        let conv_weight = conv_tree
+            .leaf("weights")?
+            .validate(&[model_dim, short_conv_config.kernel_size], data_type)?
+            .read_allocation()?;
         let conv_bias = if short_conv_config.conv_config.has_biases {
-            Some(conv_tree.leaf("biases")?.read_allocation()?)
+            Some(conv_tree.leaf("biases")?.validate(&[model_dim], data_type)?.read_allocation()?)
         } else {
             None
         };
@@ -220,7 +218,7 @@ impl<B: Backend> ShortConvMixer<B> {
             return Ok(());
         }
 
-        let elem_bytes = DataType::from(self.config.in_projection_config.activation_precision()).size_in_bytes();
+        let elem_bytes = self.data_type.size_in_bytes();
 
         let kernel_size = self.config.kernel_size;
         let state_stride = kernel_size - 1;

@@ -10,7 +10,7 @@ use crate::{
             DeltaNetPrefillKernel, DeltaNetPrefillPrepKernel, DeltaNetUpdateKernel,
         },
     },
-    config::DeltaNetAttentionConfig,
+    config::token_mixer::delta_net::DeltaNetConfig,
     encodable_block::linear::{Linear, LinearBlockError},
     forward_pass::delta_net_layer::DeltaNetLayer,
     parameters::{ParameterLoaderError, ParameterTree},
@@ -29,7 +29,7 @@ pub enum DeltaNetMixerError<B: Backend> {
 }
 
 pub(crate) struct DeltaNetMixer<B: Backend> {
-    config: DeltaNetAttentionConfig,
+    config: DeltaNetConfig,
     in_projection: Box<dyn Linear<B>>,
     out_projection: Box<dyn Linear<B>>,
     // Decode kernels
@@ -58,9 +58,11 @@ pub(crate) struct DeltaNetArguments<'a, B: Backend> {
 impl<B: Backend> DeltaNetMixer<B> {
     pub(crate) fn new(
         context: &B::Context,
-        config: DeltaNetAttentionConfig,
+        config: DeltaNetConfig,
         model_dim: usize,
         decoder_layer_loader: &ParameterTree<B::Context>,
+        data_type: DataType,
+        weights_data_type: DataType,
     ) -> Result<(Self, Option<Allocation<B>>), DeltaNetMixerError<B>> {
         if config.kernel_size < 2 {
             return Err(DeltaNetMixerError::UnsupportedConfiguration(format!(
@@ -81,7 +83,6 @@ impl<B: Backend> DeltaNetMixer<B> {
             )));
         }
 
-        let data_type: DataType = config.in_proj_config.activation_precision().into();
         let has_bias = config.conv_config.has_biases;
 
         // Load weights
@@ -89,34 +90,51 @@ impl<B: Backend> DeltaNetMixer<B> {
         let conv_tree = mixer_tree.subtree("conv")?;
 
         let (in_projection, in_projection_input_hadamard_factors) = <dyn Linear<B>>::new_extracting_input_hadamard(
-            &config.in_proj_config,
             model_dim,
             [config.total_proj_dim()],
             context,
+            weights_data_type,
             &decoder_layer_loader.subtree("mixer.in_proj")?,
         )
         .map_err(|e| DeltaNetMixerError::InnerLinearError(Box::new(e)))?;
 
         let out_projection = <dyn Linear<B>>::new(
-            &config.out_proj_config,
             config.value_dim(),
             [model_dim],
             context,
+            weights_data_type,
             &decoder_layer_loader.subtree("mixer.out_proj")?,
         )
         .map_err(|e| DeltaNetMixerError::InnerLinearError(Box::new(e)))?;
 
-        let conv_weight = conv_tree.leaf("weights")?.read_allocation()?;
+        let conv_weight = conv_tree
+            .leaf("weights")?
+            .validate(&[config.conv_dim(), config.kernel_size], data_type)?
+            .read_allocation()?;
         let conv_bias = if has_bias {
-            Some(conv_tree.leaf("biases")?.read_allocation()?)
+            Some(
+                conv_tree
+                    .leaf("biases")?
+                    .validate(&[config.conv_dim()], data_type)?
+                    .read_allocation()?,
+            )
         } else {
             None
         };
 
-        let a_log = mixer_tree.leaf("a_log")?.read_allocation()?;
-        let dt_bias = mixer_tree.leaf("dt_bias")?.read_allocation()?;
+        let a_log = mixer_tree
+            .leaf("a_log")?
+            .validate(&[config.num_heads], data_type)?
+            .read_allocation()?;
+        let dt_bias = mixer_tree
+            .leaf("dt_bias")?
+            .validate(&[config.num_heads], data_type)?
+            .read_allocation()?;
         let norm_tree = mixer_tree.subtree("norm")?;
-        let norm_weight = norm_tree.leaf("scales")?.read_allocation()?;
+        let norm_weight = norm_tree
+            .leaf("scales")?
+            .validate(&[config.value_head_dim], data_type)?
+            .read_allocation()?;
 
         // Create kernels
         let conv_update = <B::Kernels as Kernels>::DeltaNetConvUpdateKernel::new(context, data_type, has_bias)

@@ -11,7 +11,7 @@ pub use chat::Instance as ChatInstance;
 pub use classification::Instance as ClassificationInstance;
 pub use container::Container;
 pub use error::Error;
-pub use model_metadata::{ModelMetadata, resolve_model_metadata};
+pub use model_metadata::resolve_model_specialization;
 use shoji::{
     traits::{
         Backend as BackendTrait,

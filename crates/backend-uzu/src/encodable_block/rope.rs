@@ -11,17 +11,18 @@ use crate::{
 
 pub struct Rope<B: Backend> {
     kernel: <B::Kernels as Kernels>::RopeKernel,
-    data_type: DataType,
+    element_data_type: DataType,
 }
 
 impl<B: Backend> Rope<B> {
     pub fn new(
         context: &B::Context,
-        data_type: DataType,
+        element_data_type: DataType,
+        rope_data_type: DataType,
     ) -> Result<Self, B::Error> {
         Ok(Self {
-            kernel: <B::Kernels as Kernels>::RopeKernel::new(context, data_type)?,
-            data_type,
+            kernel: <B::Kernels as Kernels>::RopeKernel::new(context, element_data_type, rope_data_type)?,
+            element_data_type,
         })
     }
 
@@ -40,9 +41,9 @@ impl<B: Backend> Rope<B> {
         encoder: &mut Encoder<B>,
     ) -> Result<(Allocation<B>, Allocation<B>), B::Error> {
         let mut rotated_queries =
-            encoder.allocate_scratch(size_for_shape(&[num_heads, suffix_length, head_dim], self.data_type))?;
+            encoder.allocate_scratch(size_for_shape(&[num_heads, suffix_length, head_dim], self.element_data_type))?;
         let mut rotated_keys =
-            encoder.allocate_scratch(size_for_shape(&[num_groups, suffix_length, head_dim], self.data_type))?;
+            encoder.allocate_scratch(size_for_shape(&[num_groups, suffix_length, head_dim], self.element_data_type))?;
         self.kernel.encode(
             qkv,
             cosines,

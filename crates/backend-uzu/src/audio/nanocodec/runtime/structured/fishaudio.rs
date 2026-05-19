@@ -12,6 +12,7 @@ pub(super) fn structured_audio_dtype_key(data_type: DataType) -> u8 {
 pub(super) struct StructuredAudioPostModuleRuntime<B: Backend> {
     pub(super) context: Rc<B::Context>,
     pub(super) model_shape: ModelShape,
+    pub(super) activation_data_type: DataType,
     pub(super) shared_buffers: Rc<SharedBuffers<B>>,
     pub(super) layers: Box<[LayerExecutables<B>]>,
     pub(super) output_norm: RMSNorm<B>,

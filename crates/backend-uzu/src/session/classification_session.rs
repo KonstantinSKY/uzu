@@ -5,7 +5,7 @@ use tokenizers::Tokenizer;
 use crate::{
     backends::{common::Backend, select_backend},
     classifier::{ClassificationOutput, Classifier, ClassifierTrait},
-    config::{ClassifierModelConfig, ModelMetadata},
+    config::{model::classifier_model::ClassifierModelConfig, token_codec::AnyTokenCodecConfig},
     session::{
         helpers::{InputProcessor, InputProcessorDefault},
         types::{Error, Input},
@@ -30,7 +30,7 @@ impl ClassificationSession {
         }
 
         let config_file = std::fs::File::open(&config_path).map_err(|_| Error::UnableToLoadConfig)?;
-        let model_metadata: ModelMetadata<ClassifierModelConfig> =
+        let model_config: ClassifierModelConfig =
             serde_json::from_reader(std::io::BufReader::new(config_file)).map_err(|_| Error::UnableToLoadConfig)?;
 
         let tokenizer_path = model_path.join("tokenizer.json");
@@ -39,10 +39,12 @@ impl ClassificationSession {
         }
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|_| Error::UnableToLoadTokenizer)?;
 
+        let AnyTokenCodecConfig::ChatCodecConfig(token_codec_config) = &model_config.token_codec_config else {
+            return Err(Error::UnableToLoadConfig);
+        };
         let input_processor =
-            Box::new(InputProcessorDefault::new(model_metadata.model_config.message_processor_config.clone()))
-                as Box<dyn InputProcessor>;
-        let classifier = Box::new(Classifier::<B>::new(&model_path, &model_metadata)?);
+            Box::new(InputProcessorDefault::new(token_codec_config.clone())) as Box<dyn InputProcessor>;
+        let classifier = Box::new(Classifier::<B>::new(&model_path, &model_config)?);
 
         Ok(Self {
             tokenizer,

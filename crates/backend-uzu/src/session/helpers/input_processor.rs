@@ -4,7 +4,7 @@ use minijinja::{Environment, context};
 use minijinja_contrib::pycompat::unknown_method_callback;
 
 use crate::{
-    config::MessageProcessorConfig,
+    config::token_codec::chat_codec::ChatCodecConfig,
     session::{
         parameter::ConfigResolvableValue,
         types::{Error, Input, Role},
@@ -21,13 +21,13 @@ pub trait InputProcessor: Send + Sync {
 }
 
 pub struct InputProcessorDefault {
-    message_processing_config: MessageProcessorConfig,
+    token_codec_config: ChatCodecConfig,
 }
 
 impl InputProcessorDefault {
-    pub fn new(message_processing_config: MessageProcessorConfig) -> Self {
+    pub fn new(token_codec_config: ChatCodecConfig) -> Self {
         Self {
-            message_processing_config,
+            token_codec_config,
         }
     }
 }
@@ -86,9 +86,9 @@ impl InputProcessor for InputProcessorDefault {
         }
 
         let messages =
-            messages.into_iter().map(|message| message.resolve(&self.message_processing_config)).collect::<Vec<_>>();
-        let template = self.message_processing_config.prompt_template.clone();
-        let bos_token = self.message_processing_config.bos_token.clone();
+            messages.into_iter().map(|message| message.resolve(&self.token_codec_config)).collect::<Vec<_>>();
+        let template = self.token_codec_config.prompt_template.clone();
+        let bos_token = self.token_codec_config.bos_token.clone();
 
         let template_name = "chat_template";
         let mut environment = Environment::new();

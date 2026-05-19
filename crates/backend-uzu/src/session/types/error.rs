@@ -1,12 +1,7 @@
-use crate::{DataType, classifier::ClassifierError, config::ModelType, session::config::TtsRunConfigError};
+use crate::{DataType, classifier::ClassifierError, session::config::TtsRunConfigError};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TtsModelConfigError {
-    #[error("expected model_type={expected:?}, got {actual:?}")]
-    ModelTypeMismatch {
-        expected: ModelType,
-        actual: ModelType,
-    },
     #[error("missing TTS model config")]
     MissingTtsModelConfig,
     #[error("FishAudio tensor {key} dtype mismatch: expected {expected:?}, got {actual:?}")]
@@ -39,13 +34,13 @@ pub enum TtsModelConfigError {
     },
     #[error("FishAudio semantic token range is invalid: begin={begin}, end={end}")]
     FishAudioSemanticTokenRangeInvalid {
-        begin: i64,
-        end: i64,
+        begin: u64,
+        end: u64,
     },
     #[error("FishAudio semantic token range overflow: begin={begin}, end={end}")]
     FishAudioSemanticTokenRangeOverflow {
-        begin: i64,
-        end: i64,
+        begin: u64,
+        end: u64,
     },
     #[error(
         "FishAudio semantic codec cardinality={semantic_cardinality} does not match audio semantic codec cardinality={audio_semantic_cardinality}"

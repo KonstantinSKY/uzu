@@ -1,4 +1,4 @@
-use crate::{config::LanguageModelConfig, session::parameter::ConfigResolvableValue};
+use crate::{config::model::language_model::LanguageModelConfig, session::parameter::ConfigResolvableValue};
 
 #[derive(Debug, Clone, Copy)]
 pub enum ContextLength {
@@ -18,7 +18,7 @@ impl ConfigResolvableValue<LanguageModelConfig, usize> for ContextLength {
         &self,
         config: &LanguageModelConfig,
     ) -> usize {
-        let model_context_length = config.model_config.transformer_config.context_length;
+        let model_context_length = config.decoder_config.transformer_config.context_length;
         let proposed_value = match self {
             ContextLength::Default => {
                 if cfg!(target_os = "ios") {

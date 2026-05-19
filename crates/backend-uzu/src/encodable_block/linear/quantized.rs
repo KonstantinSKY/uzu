@@ -6,7 +6,7 @@ use crate::{
     array::size_for_shape,
     backends::common::{
         Allocation, Backend, Encoder,
-        gpu_types::QuantizationMethod,
+        gpu_types::{QuantizationMethod, QuantizationMode},
         kernel::{
             Kernels, TensorAddBiasKernel,
             quant_matmul::{
@@ -15,7 +15,6 @@ use crate::{
             },
         },
     },
-    config::QuantizationConfig,
     parameters::{ParameterLoaderError, ParameterTree},
 };
 
@@ -24,60 +23,13 @@ pub enum QuantizedLinearError<B: Backend> {
     #[error("Backend error: {0}")]
     BackendError(#[source] B::Error),
     #[error("QuantizedMatmul error: {0}")]
-    QuantizedMatmulError(#[source] QuantizedMatmulError<B>),
+    QuantizedMatmulError(#[from] QuantizedMatmulError<B>),
     #[error("Parameter loading error: {0}")]
-    ParameterError(ParameterLoaderError<B>),
+    ParameterError(#[from] ParameterLoaderError<B>),
     #[error("Unsupported data type for quantized kernel: {0:?}")]
     UnsupportedDataType(DataType),
-    #[error("Expected weights of type {expected:?}, got {got:?}")]
-    InvalidWeightsDataType {
-        expected: DataType,
-        got: DataType,
-    },
-    #[error("Scales dtype mismatch: got {got:?}, expected {expected:?}")]
-    InvalidScalesDataType {
-        expected: DataType,
-        got: DataType,
-    },
-    #[error(
-        "Unexpected scale-bias shapes. weights={weights:?}, scales={scales:?}, deq_biases={deq_biases:?}; expected [N,K/{packing_divisor}],[N,K_g],[N,K_g]"
-    )]
-    InvalidScaleBiasShapes {
-        weights: Box<[usize]>,
-        scales: Box<[usize]>,
-        deq_biases: Box<[usize]>,
-        packing_divisor: usize,
-    },
-    #[error("deq_biases dtype mismatch: got {got:?}, expected {expected:?}")]
-    InvalidDeqBiasesDataType {
-        expected: DataType,
-        got: DataType,
-    },
-    #[error(
-        "Unexpected scale-zero-point shapes. weights={weights:?}, scales={scales:?}, zero_points={zero_points:?}; expected [N,K/{packing_divisor}],[N,K_g],[N,(K_g+{packing_minus_one})/{packing_divisor}]"
-    )]
-    InvalidScaleZeroPointShapes {
-        weights: Box<[usize]>,
-        scales: Box<[usize]>,
-        zero_points: Box<[usize]>,
-        packing_divisor: usize,
-        packing_minus_one: usize,
-    },
-    #[error("Zero-points dtype mismatch: got {got:?}, expected {expected:?}")]
-    InvalidZeroPointsDataType {
-        expected: DataType,
-        got: DataType,
-    },
-    #[error("Bias shape mismatch: got {got:?}, expected [{expected_output_dim}]")]
-    InvalidBiasShape {
-        got: Box<[usize]>,
-        expected_output_dim: usize,
-    },
-    #[error("Bias dtype mismatch: got {got:?}, expected {expected:?}")]
-    InvalidBiasDataType {
-        expected: DataType,
-        got: DataType,
-    },
+    #[error("Unsupported quantized linear configuration: {0}")]
+    UnsupportedConfiguration(String),
 }
 
 pub struct QuantizedLinear<B: Backend> {
@@ -95,149 +47,88 @@ pub struct QuantizedLinear<B: Backend> {
 impl<B: Backend> QuantizedLinear<B> {
     pub fn new(
         context: &B::Context,
-        config: &QuantizationConfig,
+        bits: u32,
+        group_size: usize,
+        quantization_method: QuantizationMethod,
         input_dim: usize,
         output_dim: usize,
-        parameter_tree: &ParameterTree<B::Context>,
+        data_type: DataType,
+        weights_tree: &ParameterTree<B::Context>,
+        bias_tree: Option<&ParameterTree<B::Context>>,
         output_hadamard_factors: Option<Allocation<B>>,
     ) -> Result<Self, QuantizedLinearError<B>> {
-        let kernel_data_type: DataType = config.activation_precision.into();
-        if !matches!(kernel_data_type, DataType::F16 | DataType::BF16 | DataType::F32) {
-            return Err(QuantizedLinearError::UnsupportedDataType(kernel_data_type));
-        }
-
-        let weights_leaf = parameter_tree.leaf("weights").map_err(QuantizedLinearError::ParameterError)?;
-        let packing_divisor = config.weight_quantization_mode.packing_divisor();
-        let storage_type = config.weight_quantization_mode.storage_type();
-        if weights_leaf.data_type() != storage_type {
-            return Err(QuantizedLinearError::InvalidWeightsDataType {
-                expected: storage_type,
-                got: weights_leaf.data_type(),
-            });
-        }
-
-        let scales_leaf = parameter_tree.leaf("scales").map_err(QuantizedLinearError::ParameterError)?;
-        if scales_leaf.data_type() != kernel_data_type {
-            return Err(QuantizedLinearError::InvalidScalesDataType {
-                expected: kernel_data_type,
-                got: scales_leaf.data_type(),
-            });
-        }
-
-        let k_g = (input_dim + config.group_size - 1) / config.group_size;
-        let weights_shape = weights_leaf.shape().to_vec();
-        let scales_shape = scales_leaf.shape().to_vec();
-        let (quantization_method, zero_points_or_biases) = match parameter_tree.leaf("deq_biases") {
-            Ok(deq_biases) => {
-                let deq_biases_shape = deq_biases.shape().to_vec();
-                if !(weights_shape == [output_dim, input_dim / packing_divisor]
-                    && scales_shape == [output_dim, k_g]
-                    && deq_biases_shape == [output_dim, k_g])
-                {
-                    return Err(QuantizedLinearError::InvalidScaleBiasShapes {
-                        weights: weights_shape.into_boxed_slice(),
-                        scales: scales_shape.into_boxed_slice(),
-                        deq_biases: deq_biases_shape.into_boxed_slice(),
-                        packing_divisor,
-                    });
-                }
-
-                if deq_biases.data_type() != kernel_data_type {
-                    return Err(QuantizedLinearError::InvalidDeqBiasesDataType {
-                        expected: kernel_data_type,
-                        got: deq_biases.data_type(),
-                    });
-                }
-
-                (
-                    QuantizationMethod::ScaleBias,
-                    deq_biases.read_allocation().map_err(QuantizedLinearError::ParameterError)?,
-                )
-            },
-            Err(_) => {
-                let zero_points_leaf =
-                    parameter_tree.leaf("zero_points").map_err(QuantizedLinearError::ParameterError)?;
-                let zero_points_shape = zero_points_leaf.shape().to_vec();
-                let expected_zero_points_entries = (k_g + packing_divisor - 1) / packing_divisor;
-                if !(weights_shape == [output_dim, input_dim / packing_divisor]
-                    && scales_shape == [output_dim, k_g]
-                    && zero_points_shape == [output_dim, expected_zero_points_entries])
-                {
-                    return Err(QuantizedLinearError::InvalidScaleZeroPointShapes {
-                        weights: weights_shape.into_boxed_slice(),
-                        scales: scales_shape.into_boxed_slice(),
-                        zero_points: zero_points_shape.into_boxed_slice(),
-                        packing_divisor,
-                        packing_minus_one: packing_divisor - 1,
-                    });
-                }
-
-                if zero_points_leaf.data_type() != storage_type {
-                    return Err(QuantizedLinearError::InvalidZeroPointsDataType {
-                        expected: storage_type,
-                        got: zero_points_leaf.data_type(),
-                    });
-                }
-
-                (
-                    QuantizationMethod::ScaleZeroPoint,
-                    zero_points_leaf.read_allocation().map_err(QuantizedLinearError::ParameterError)?,
-                )
+        let weight_quantization_mode = match bits {
+            4 => QuantizationMode::U4,
+            8 => QuantizationMode::U8,
+            _ => {
+                return Err(QuantizedLinearError::UnsupportedConfiguration(format!(
+                    "{quantization_method} bits={bits}, group_size={group_size}"
+                )));
             },
         };
 
-        let (bias_add_kernel, biases) = match parameter_tree.leaf("biases") {
-            Ok(biases_leaf) => {
-                let bias_shape = biases_leaf.shape().to_vec();
-                if bias_shape != [output_dim] {
-                    return Err(QuantizedLinearError::InvalidBiasShape {
-                        got: bias_shape.into_boxed_slice(),
-                        expected_output_dim: output_dim,
-                    });
-                }
+        if !matches!(data_type, DataType::F16 | DataType::BF16 | DataType::F32) {
+            return Err(QuantizedLinearError::UnsupportedDataType(data_type));
+        }
 
-                if biases_leaf.data_type() != kernel_data_type {
-                    return Err(QuantizedLinearError::InvalidBiasDataType {
-                        expected: kernel_data_type,
-                        got: biases_leaf.data_type(),
-                    });
-                }
+        let packing_divisor = weight_quantization_mode.packing_divisor();
+        let storage_type = weight_quantization_mode.storage_type();
+        let k_g = input_dim.div_ceil(group_size);
+        let weights = weights_tree
+            .leaf("weights")?
+            .validate(&[output_dim, input_dim / packing_divisor], storage_type)?
+            .read_allocation()?;
+        let scales = weights_tree.leaf("scales")?.validate(&[output_dim, k_g], data_type)?.read_allocation()?;
+        let zero_points_or_biases = match quantization_method {
+            QuantizationMethod::ScaleBias => weights_tree
+                .leaf("biases")?
+                .validate(&[output_dim, k_g], data_type)?
+                .read_allocation()?,
+            QuantizationMethod::ScaleZeroPoint => {
+                let expected_zero_points_entries = (k_g + packing_divisor - 1) / packing_divisor;
+                weights_tree
+                    .leaf("zero_points")?
+                    .validate(&[output_dim, expected_zero_points_entries], storage_type)?
+                    .read_allocation()?
+            },
+        };
 
+        let (bias_add_kernel, biases) = match bias_tree.and_then(|tree| tree.leaf("biases").ok()) {
+            Some(biases_leaf) => {
                 let bias_add_kernel =
-                    <B::Kernels as Kernels>::TensorAddBiasKernel::new(context, kernel_data_type, true)
+                    <B::Kernels as Kernels>::TensorAddBiasKernel::new(context, data_type, true)
                         .map_err(QuantizedLinearError::BackendError)?;
                 (
                     Some(bias_add_kernel),
-                    Some(biases_leaf.read_allocation().map_err(QuantizedLinearError::ParameterError)?),
+                    Some(biases_leaf.validate(&[output_dim], data_type)?.read_allocation()?),
                 )
             },
-            Err(_) => (None, None),
+            None => (None, None),
         };
 
         let kernel = QuantizedMatmulKernelEncodable::new(
             context,
             QuantizedMatmulConfiguration {
-                data_type: kernel_data_type,
-                group_size: config.group_size,
+                data_type,
+                group_size,
                 input_dim,
                 output_dim,
-                mode: config.weight_quantization_mode,
+                mode: weight_quantization_mode,
                 quantization_method,
                 use_hadamard: output_hadamard_factors.is_some(),
             },
-        )
-        .map_err(QuantizedLinearError::QuantizedMatmulError)?;
+        )?;
 
         Ok(Self {
             kernel,
             bias_add_kernel,
             biases,
-            weights: weights_leaf.read_allocation().map_err(QuantizedLinearError::ParameterError)?,
-            scales: scales_leaf.read_allocation().map_err(QuantizedLinearError::ParameterError)?,
+            weights,
+            scales,
             zero_points_or_biases,
             output_hadamard_factors,
             output_dim,
-            output_data_type: kernel_data_type,
+            output_data_type: data_type,
         })
     }
 }

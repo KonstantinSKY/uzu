@@ -2,8 +2,9 @@ use super::{decoder_support::*, *};
 use crate::{
     array::{Array, ArrayContextExt},
     backends::common::{Allocation, AsBufferRangeRef, DenseBuffer},
+    config::decoder::DecoderConfig,
     encodable_block::{DecoderArguments, DecoderDecodeInput, SamplingInputs},
-    forward_pass::token_inputs::TokenInputs,
+    forward_pass::{config::decoder::DecoderForwardPassConfig, token_inputs::TokenInputs},
     session::types::TtsModelConfigError,
 };
 
@@ -17,33 +18,32 @@ struct TokenDecoderLoadedModel<B: Backend> {
 impl<B: Backend> TokenDecoderLoadedModel<B> {
     fn load(
         context: &Rc<B::Context>,
-        model_path: &Path,
-        decoder_config: &Rc<crate::config::DecoderConfig>,
+        decoder_config: &Rc<DecoderConfig>,
         model_shape: &ModelShape,
+        forward_pass_config: &DecoderForwardPassConfig,
+        root_loader_view: &crate::parameters::ParameterTree<B::Context>,
         transformer_subtree: &str,
         embedding_subtree: &str,
         readout_subtree: &str,
     ) -> Result<Self, Error> {
-        let weights_path = model_path.join("model.safetensors");
-        let weights_file = File::open(&weights_path).map_err(|_| Error::UnableToLoadWeights)?;
-        let loader = ParameterLoader::new(&weights_file, context.as_ref()).map_err(|_| Error::UnableToLoadWeights)?;
-        let root_loader_view = loader.tree();
-
         let shared_buffers = TokenDecoderContext::<B>::build_shared_buffers(
             context,
             decoder_config,
-            &root_loader_view,
+            forward_pass_config,
+            root_loader_view,
             transformer_subtree,
         )?;
         let executables = Decoder::new_with_embedding_and_readout_subtrees(
             context.as_ref(),
             &decoder_config,
-            &root_loader_view,
+            root_loader_view,
             transformer_subtree,
             embedding_subtree,
             readout_subtree,
+            model_shape,
+            forward_pass_config,
         );
-        let logits_data_type = model_shape.activation_data_type();
+        let logits_data_type = forward_pass_config.embedding_forward_pass_config.activation_data_type;
         let sampler = GpuSampling::new(context.as_ref(), logits_data_type).map_err(unable_to_create_context)?;
         let token_copy_sampled =
             <B::Kernels as Kernels>::TokenCopySampledKernel::new(context.as_ref()).map_err(unable_to_create_context)?;
@@ -62,7 +62,8 @@ struct TokenDecoderContext<B: Backend> {
     cache_layers: Rc<RefCell<CacheLayers<B>>>,
     shared_buffers: Rc<SharedBuffers<B>>,
     model_shape: ModelShape,
-    decoder_config: Rc<crate::config::DecoderConfig>,
+    forward_pass_config: DecoderForwardPassConfig,
+    decoder_config: Rc<DecoderConfig>,
     runtime_config: TextDecoderRuntimeConfig,
     executables: Decoder<B>,
     sampler: GpuSampling<B>,
@@ -83,22 +84,29 @@ impl<B: Backend> TokenDecoderContext<B> {
     fn new(
         context: Rc<B::Context>,
         model_path: &Path,
-        decoder_config: Rc<crate::config::DecoderConfig>,
+        decoder_config: Rc<DecoderConfig>,
         transformer_subtree: &str,
         embedding_subtree: &str,
         readout_subtree: &str,
         runtime_config: &TextDecoderRuntimeConfig,
     ) -> Result<(Self, DataType), Error> {
+        let weights_path = model_path.join("model.safetensors");
+        let weights_file = File::open(&weights_path).map_err(|_| Error::UnableToLoadWeights)?;
+        let loader = ParameterLoader::new(&weights_file, context.as_ref()).map_err(|_| Error::UnableToLoadWeights)?;
+        let root_loader_view = loader.tree();
+
         let model_shape = ModelShape::from_decoder_config(&decoder_config);
+        let forward_pass_config = DecoderForwardPassConfig::new_for_inference();
+        let activation_data_type = forward_pass_config.embedding_forward_pass_config.activation_data_type;
         let max_suffix_length =
             text_decoder_prefill_step_size(runtime_config, decoder_config.transformer_config.context_length).max(32);
         let max_prefix_length = max_suffix_length;
-        let activation_data_type = model_shape.activation_data_type();
         let loaded_model = TokenDecoderLoadedModel::<B>::load(
             &context,
-            model_path,
             &decoder_config,
             &model_shape,
+            &forward_pass_config,
+            &root_loader_view,
             transformer_subtree,
             embedding_subtree,
             readout_subtree,
@@ -109,11 +117,11 @@ impl<B: Backend> TokenDecoderContext<B> {
         let cache_layers = Rc::new(RefCell::new(CacheLayers::new(
             context.as_ref(),
             &model_shape,
+            activation_data_type,
             max_prefix_length,
             max_suffix_length,
         )));
-        let intermediate_data_type: DataType =
-            decoder_config.transformer_config.output_norm_config.scale_precision.into();
+        let intermediate_data_type = activation_data_type;
         let kv_cache_update = KVCacheUpdate::new(context.as_ref(), intermediate_data_type, max_prefix_length)
             .map_err(unable_to_create_context)?;
 
@@ -123,6 +131,7 @@ impl<B: Backend> TokenDecoderContext<B> {
                 cache_layers,
                 shared_buffers: loaded_model.shared_buffers,
                 model_shape,
+                forward_pass_config,
                 decoder_config,
                 runtime_config: runtime_config.clone(),
                 executables: loaded_model.executables,
@@ -141,11 +150,13 @@ impl<B: Backend> TokenDecoderContext<B> {
 
     fn build_shared_buffers(
         context: &Rc<B::Context>,
-        decoder_config: &Rc<crate::config::DecoderConfig>,
+        decoder_config: &Rc<DecoderConfig>,
+        forward_pass_config: &DecoderForwardPassConfig,
         root_loader_view: &crate::parameters::ParameterTree<B::Context>,
         transformer_subtree: &str,
     ) -> Result<Rc<SharedBuffers<B>>, Error> {
-        let mut shared_buffers = SharedBuffers::new(context.as_ref(), decoder_config);
+        let mut shared_buffers =
+            SharedBuffers::new(context.as_ref(), decoder_config, &forward_pass_config.transformer_forward_pass_config);
         let transformer_tree = root_loader_view.subtree(transformer_subtree).map_err(|_| Error::UnableToLoadWeights)?;
         shared_buffers.update_data_from_transformer_tree(&transformer_tree)?;
         Ok(Rc::new(shared_buffers))
@@ -176,7 +187,7 @@ pub(super) struct TokenDecoderRunner<B: Backend> {
 
 impl<B: Backend> TokenDecoderRunner<B> {
     pub(super) fn activation_data_type(&self) -> DataType {
-        self.ctx.model_shape.activation_data_type()
+        self.ctx.forward_pass_config.embedding_forward_pass_config.activation_data_type
     }
 
     pub(super) fn context(&self) -> &Rc<B::Context> {
@@ -186,7 +197,7 @@ impl<B: Backend> TokenDecoderRunner<B> {
     pub(super) fn new_with_context(
         context: Rc<B::Context>,
         model_path: &Path,
-        decoder_config: Rc<crate::config::DecoderConfig>,
+        decoder_config: Rc<DecoderConfig>,
         transformer_subtree: &str,
         embedding_subtree: &str,
         readout_subtree: &str,
@@ -335,10 +346,14 @@ impl<B: Backend> TokenDecoderRunner<B> {
             return Ok(());
         }
         let context = self.ctx.context.as_ref();
-        *self.ctx.cache_layers.borrow_mut() =
-            CacheLayers::new(context, &self.ctx.model_shape, max_prefix_length, max_suffix_length);
-        let intermediate_data_type: DataType =
-            self.ctx.decoder_config.transformer_config.output_norm_config.scale_precision.into();
+        let intermediate_data_type = self.ctx.forward_pass_config.embedding_forward_pass_config.activation_data_type;
+        *self.ctx.cache_layers.borrow_mut() = CacheLayers::new(
+            context,
+            &self.ctx.model_shape,
+            intermediate_data_type,
+            max_prefix_length,
+            max_suffix_length,
+        );
         self.ctx.kv_cache_update =
             KVCacheUpdate::new(context, intermediate_data_type, max_prefix_length).map_err(unable_to_create_context)?;
         self.ctx.current_max_prefix_length = max_prefix_length;

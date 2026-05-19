@@ -37,7 +37,7 @@ use crate::{
             matmul::{MatmulArgumentC, MatmulArguments, MatmulKernel},
         },
     },
-    config::{ModelMetadata, TtsMessageProcessorConfig, TtsModelConfig},
+    config::{model::tts_model::TTSModelConfig, token_codec::tts_codec::TTSCodecConfig},
     encodable_block::{Decoder, Sampling as GpuSampling},
     forward_pass::{cache_layers::CacheLayers, model_shape::ModelShape, state::SharedBuffers},
     parameters::ParameterLoader,
@@ -85,7 +85,7 @@ pub struct TtsSession<B: Backend> {
     tokenizer: Tokenizer,
     audio: AudioGenerationContext<B>,
     audio_decoder: Box<dyn AudioDecoderBackend>,
-    message_processor_config: TtsMessageProcessorConfig,
+    token_codec_config: TTSCodecConfig,
     text_decoder: Box<dyn SemanticDecoderBackend>,
     last_execution_stats: Option<TtsExecutionStats>,
 }

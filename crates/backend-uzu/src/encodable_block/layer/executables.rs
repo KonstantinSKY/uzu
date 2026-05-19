@@ -2,8 +2,6 @@
 
 use std::rc::Rc;
 
-use half::{bf16, f16};
-
 use super::MixerExecutables;
 #[cfg(feature = "tracing")]
 use crate::backends::common::{Kernels, kernel::TensorAddBiasKernel};
@@ -12,12 +10,18 @@ use crate::forward_pass::traces::LayerActivationTrace;
 use crate::{
     DataType,
     backends::common::{Allocation, AsBufferRangeRef, Backend, Encoder},
-    config::{MixerConfig, TransformerConfig, TransformerLayerConfig},
+    config::{
+        token_mixer::AnyTokenMixerConfig,
+        transformer::TransformerConfig,
+        transformer_layer::TransformerLayerConfig,
+    },
     encodable_block::{
         Attention, AttentionArguments, DeltaNetArguments, DeltaNetMixer, Linear, MambaArguments, MambaMixer, Mlp,
         PostLayerScalar, QKVNorm, QkUnpack, RMSNorm, Rope, ShortConvArguments, ShortConvMixer,
     },
-    forward_pass::{cache_layers::LayerCacheAccess, state::RopeBuffers},
+    forward_pass::{
+        cache_layers::LayerCacheAccess, config::transformer::TransformerForwardPassConfig, state::RopeBuffers,
+    },
     parameters::ParameterTree,
 };
 
@@ -46,23 +50,18 @@ impl<B: Backend> LayerExecutables<B> {
         decoder_layer_loader: &ParameterTree<B::Context>,
         rope: &Rc<Rope<B>>,
         qk_unpack: &Rc<QkUnpack<B>>,
+        forward_pass_config: &TransformerForwardPassConfig,
+        intermediate_data_type: DataType,
+        weights_data_type: DataType,
     ) -> Self {
-        let intermediate_data_type: DataType = layer_config.mixer_config.activation_precision().into();
-
         let (residual_sum_scalar, output_scalar) = if layer_config.has_post_layer_scalar {
             assert!(
                 layer_config.post_mlp_norm_config.is_some(),
                 "layer {layer_index} sets post_layer_scalar but has no post_mlp_norm"
             );
             let leaf = decoder_layer_loader.leaf("post_layer_scalar").expect("Failed to read post_layer_scalar weight");
-            let scalar = match leaf.data_type() {
-                DataType::BF16 => {
-                    leaf.read_slice::<bf16>().expect("Failed to read post_layer_scalar weight")[0].to_f32()
-                },
-                DataType::F16 => leaf.read_slice::<f16>().expect("Failed to read post_layer_scalar weight")[0].to_f32(),
-                DataType::F32 => leaf.read_slice::<f32>().expect("Failed to read post_layer_scalar weight")[0],
-                other => panic!("post_layer_scalar must be a float dtype, got {other:?}"),
-            };
+            let leaf = leaf.validate(&[1], DataType::F32).expect("Invalid post_layer_scalar tensor");
+            let scalar = leaf.read_slice::<f32>().expect("Failed to read post_layer_scalar weight")[0];
             (PostLayerScalar::ScaleResidualSum(scalar), PostLayerScalar::ScaleOutput(scalar))
         } else {
             (PostLayerScalar::None, PostLayerScalar::None)
@@ -73,63 +72,42 @@ impl<B: Backend> LayerExecutables<B> {
             .expect("Failed to create TensorAddBiasKernel kernel"); // TODO: this function return Result
 
         let (mixer, mixer_hadamard_factors) = match &layer_config.mixer_config {
-            MixerConfig::Attention(attention_config) => {
+            AnyTokenMixerConfig::AttentionConfig(attention_config) => {
                 let q_dim = attention_config.num_heads * attention_config.head_dim;
                 let kv_dim = attention_config.num_groups * attention_config.head_dim;
 
-                let (qkv_projection, input_hadamard_factors) = <dyn Linear<B>>::new_extracting_input_hadamard(
-                    &attention_config.qkv_projection_config,
-                    transformer_config.model_dim,
-                    [q_dim, kv_dim, kv_dim],
-                    context,
-                    &decoder_layer_loader.subtree("mixer.qkv_projection").unwrap(),
-                )
-                .expect("Failed to create qkv projection");
-
-                let gate_projection = attention_config.gate_projection_config.as_ref().map(|gate_config| {
-                    let gate_tree = decoder_layer_loader.subtree("mixer.gate_projection").unwrap();
-                    match (input_hadamard_factors.is_some(), gate_config) {
-                        (
-                            true,
-                            crate::config::LinearConfig::RHTLinearWrapper {
-                                inner_config,
-                                ..
-                            },
-                        ) => {
-                            let output_factors = gate_tree
-                                .leaf("output_factors")
-                                .expect("Failed to get gate projection output_factors")
-                                .read_allocation()
-                                .expect("Failed to read gate projection output_factors");
-                            let inner_tree = gate_tree
-                                .subtree("inner_linear")
-                                .expect("Failed to get gate projection inner_linear subtree");
-                            <dyn Linear<B>>::new_with_output_hadamard(
-                                context,
-                                inner_config,
-                                &inner_tree,
-                                output_factors,
-                                transformer_config.model_dim,
-                                q_dim,
-                            )
-                        },
-                        (
-                            false,
-                            crate::config::LinearConfig::RHTLinearWrapper {
-                                ..
-                            },
-                        )
-                        | (true, _) => {
-                            panic!("attention qkv/gate projections must share input hadamard")
-                        },
-                        (false, _) => <dyn Linear<B>>::new(
-                            gate_config,
+                let has_gate_projection = attention_config.gate_projection_config.is_some();
+                let (qkv_projection, input_hadamard_factors) = if has_gate_projection {
+                    (
+                        <dyn Linear<B>>::new(
                             transformer_config.model_dim,
-                            [q_dim],
+                            [q_dim, kv_dim, kv_dim],
                             context,
-                            &gate_tree,
-                        ),
-                    }
+                            weights_data_type,
+                            &decoder_layer_loader.subtree("mixer.qkv_projection").unwrap(),
+                        )
+                        .expect("Failed to create qkv projection"),
+                        None,
+                    )
+                } else {
+                    <dyn Linear<B>>::new_extracting_input_hadamard(
+                        transformer_config.model_dim,
+                        [q_dim, kv_dim, kv_dim],
+                        context,
+                        weights_data_type,
+                        &decoder_layer_loader.subtree("mixer.qkv_projection").unwrap(),
+                    )
+                    .expect("Failed to create qkv projection")
+                };
+
+                let gate_projection = attention_config.gate_projection_config.as_ref().map(|_| {
+                    <dyn Linear<B>>::new(
+                        transformer_config.model_dim,
+                        [q_dim],
+                        context,
+                        weights_data_type,
+                        &decoder_layer_loader.subtree("mixer.gate_projection").unwrap(),
+                    )
                     .expect("Failed to create gate projection")
                 });
 
@@ -141,6 +119,7 @@ impl<B: Backend> LayerExecutables<B> {
                     match QKVNorm::new(
                         context,
                         intermediate_data_type,
+                        &forward_pass_config.mixer_forward_pass_config.normalization_forward_pass_config,
                         attention_config.query_norm_config.clone(),
                         attention_config.key_norm_config.clone(),
                         value_norm_config,
@@ -159,10 +138,10 @@ impl<B: Backend> LayerExecutables<B> {
                 };
 
                 let out_projection = <dyn Linear<B>>::new(
-                    &attention_config.out_projection_config,
                     q_dim,
                     [transformer_config.model_dim],
                     context,
+                    weights_data_type,
                     &decoder_layer_loader.subtree("mixer.out_projection").unwrap(),
                 )
                 .expect("Failed to create out projection");
@@ -187,10 +166,16 @@ impl<B: Backend> LayerExecutables<B> {
                     input_hadamard_factors,
                 )
             },
-            MixerConfig::Mamba(mamba_config) => {
-                let (mixer, input_hadamard_factors) =
-                    MambaMixer::new(context, mamba_config.clone(), transformer_config.model_dim, decoder_layer_loader)
-                        .expect("Failed to create Mamba mixer");
+            AnyTokenMixerConfig::Mamba2Config(mamba_config) => {
+                let (mixer, input_hadamard_factors) = MambaMixer::new(
+                    context,
+                    mamba_config.clone(),
+                    transformer_config.model_dim,
+                    decoder_layer_loader,
+                    intermediate_data_type,
+                    weights_data_type,
+                )
+                .expect("Failed to create Mamba mixer");
                 (
                     MixerExecutables::StateSpace {
                         mixer,
@@ -198,12 +183,14 @@ impl<B: Backend> LayerExecutables<B> {
                     input_hadamard_factors,
                 )
             },
-            MixerConfig::ShortConv(short_conv_config) => {
+            AnyTokenMixerConfig::ShortConvConfig(short_conv_config) => {
                 let (mixer, input_hadamard_factors) = ShortConvMixer::new(
                     context,
                     short_conv_config.clone(),
                     transformer_config.model_dim,
                     decoder_layer_loader,
+                    intermediate_data_type,
+                    weights_data_type,
                 )
                 .expect("Failed to create ShortConv mixer");
                 (
@@ -213,12 +200,14 @@ impl<B: Backend> LayerExecutables<B> {
                     input_hadamard_factors,
                 )
             },
-            MixerConfig::DeltaNet(delta_net_config) => {
+            AnyTokenMixerConfig::DeltaNetConfig(delta_net_config) => {
                 let (mixer, input_hadamard_factors) = DeltaNetMixer::new(
                     context,
                     delta_net_config.clone(),
                     transformer_config.model_dim,
                     decoder_layer_loader,
+                    intermediate_data_type,
+                    weights_data_type,
                 )
                 .expect("Failed to create DeltaNet mixer");
                 (
@@ -233,6 +222,8 @@ impl<B: Backend> LayerExecutables<B> {
         let pre_mixer_norm = RMSNorm::new(
             context,
             intermediate_data_type,
+            transformer_config.model_dim,
+            &forward_pass_config.normalization_forward_pass_config,
             layer_config.pre_mixer_norm_config.clone().expect("decoder layers require pre_mixer_norm_config"),
             &decoder_layer_loader.subtree("pre_mixer_norm").unwrap(),
             mixer_hadamard_factors,
@@ -247,6 +238,8 @@ impl<B: Backend> LayerExecutables<B> {
                 RMSNorm::new(
                     context,
                     intermediate_data_type,
+                    transformer_config.model_dim,
+                    &forward_pass_config.normalization_forward_pass_config,
                     norm_config.clone(),
                     &decoder_layer_loader.subtree("post_mixer_norm").unwrap(),
                     None,
@@ -266,12 +259,16 @@ impl<B: Backend> LayerExecutables<B> {
             layer_config.hidden_dim.unwrap_or(transformer_config.hidden_dim),
             context,
             &decoder_layer_loader.subtree("mlp").unwrap(),
+            intermediate_data_type,
+            weights_data_type,
         )
         .expect("Failed to create mlp block");
 
         let pre_mlp_norm = RMSNorm::new(
             context,
             intermediate_data_type,
+            transformer_config.model_dim,
+            &forward_pass_config.normalization_forward_pass_config,
             layer_config.pre_mlp_norm_config.clone(),
             &decoder_layer_loader.subtree("pre_mlp_norm").unwrap(),
             mlp_input_hadamard_factors,
@@ -286,6 +283,8 @@ impl<B: Backend> LayerExecutables<B> {
                 RMSNorm::new(
                     context,
                     intermediate_data_type,
+                    transformer_config.model_dim,
+                    &forward_pass_config.normalization_forward_pass_config,
                     norm_config.clone(),
                     &decoder_layer_loader.subtree("post_mlp_norm").unwrap(),
                     None,
@@ -412,7 +411,8 @@ impl<B: Backend> LayerExecutables<B> {
             } => {
                 let Some(LayerCacheAccess::Owned {
                     entry,
-                }) = cache_access else {
+                }) = cache_access
+                else {
                     panic!("State-space layer requires writable cache state");
                 };
                 let layer = entry.as_state_space_mut().expect("State-space mixer expects SSM cache layer");
@@ -430,7 +430,8 @@ impl<B: Backend> LayerExecutables<B> {
             } => {
                 let Some(LayerCacheAccess::Owned {
                     entry,
-                }) = cache_access else {
+                }) = cache_access
+                else {
                     panic!("ShortConv layer requires writable cache state");
                 };
                 let layer = entry.as_short_conv_mut().expect("ShortConv mixer expects ShortConv cache layer");
@@ -451,7 +452,8 @@ impl<B: Backend> LayerExecutables<B> {
             } => {
                 let Some(LayerCacheAccess::Owned {
                     entry,
-                }) = cache_access else {
+                }) = cache_access
+                else {
                     panic!("DeltaNet layer requires writable cache state");
                 };
                 let layer = entry.as_delta_net_mut().expect("DeltaNet mixer expects DeltaNet cache layer");

@@ -17,7 +17,10 @@ use crate::{
             },
         },
     },
-    config::{LinearConfig, MixtureOfExpertsConfig, RoutingFunctionConfig},
+    config::{
+        mlp::{mixture_of_experts::MixtureOfExpertsConfig, routing_function::AnyRoutingFunction},
+        weight_matrix::{AnyWeightMatrixSpec, Layout, full_precision_spec::FullPrecisionSpec},
+    },
     encodable_block::mlp::Mlp,
     parameters::{ParameterLoaderError, ParameterTree},
 };
@@ -66,6 +69,8 @@ pub enum MoeBlockError<B: Backend> {
     UnsupportedSharedExperts,
     #[error("MoE expert gate is not supported")]
     UnsupportedExpertGate,
+    #[error("Unsupported MoE router configuration: {0}")]
+    UnsupportedRouterConfiguration(String),
 }
 
 impl<B: Backend> MoeBlock<B> {
@@ -73,6 +78,7 @@ impl<B: Backend> MoeBlock<B> {
         context: &B::Context,
         moe_config: &MixtureOfExpertsConfig,
         model_dim: usize,
+        data_type: DataType,
         parameter_tree: &ParameterTree<B::Context>,
     ) -> Result<Self, MoeBlockError<B>> {
         if model_dim % 4 != 0 {
@@ -91,7 +97,6 @@ impl<B: Backend> MoeBlock<B> {
             return Err(MoeBlockError::UnsupportedExpertGate);
         }
 
-        let data_type: DataType = moe_config.expert_config.linear_config.activation_precision().into();
         let gating_code = match moe_config.expert_config.activation.act_type() {
             ActivationType::GELU => 3,
             ActivationType::SILU {
@@ -102,18 +107,58 @@ impl<B: Backend> MoeBlock<B> {
             },
         };
 
-        let router_data_type: DataType = moe_config.router_config.activation_precision().into();
-
-        let router_renorm = matches!(moe_config.routing_function, RoutingFunctionConfig::SoftmaxRouting);
+        let router_renorm = matches!(moe_config.routing_function, AnyRoutingFunction::SoftmaxRouting(_));
 
         let router_tree = parameter_tree.subtree("router")?;
-        if !matches!(moe_config.router_config, LinearConfig::FullPrecision { .. }) {
-            unimplemented!("Only FullPrecision MoE router is supported; got {:?}", moe_config.router_config);
+        let router_weights_tree = router_tree.subtree("weights")?;
+        let router_spec = router_weights_tree.metadata::<AnyWeightMatrixSpec>("spec")?;
+        if let AnyWeightMatrixSpec::FullPrecisionSpec(FullPrecisionSpec {
+            layout: Layout::OutputInput,
+            ..
+        }) = &router_spec
+        {
+        } else {
+            return Err(MoeBlockError::UnsupportedRouterConfiguration(format!("{router_spec:?}")));
         }
-        let router_weights = router_tree.leaf_allocation("weights")?;
-        let router_biases = router_tree.leaf_allocation("biases")?;
+        let router_weights = router_weights_tree
+            .leaf("weights")?
+            .validate(&[moe_config.num_routed_experts, model_dim], data_type)?
+            .read_allocation()?;
+        let router_biases = router_tree
+            .leaf("biases")?
+            .validate(&[moe_config.num_routed_experts], data_type)?
+            .read_allocation()?;
 
-        let router_topk_kernel = <B::Kernels as Kernels>::MoeRouterTopKKernel::new(context, router_data_type)
+        let experts_tree = parameter_tree.subtree("experts")?;
+        let up_tree = experts_tree.subtree("up_projection")?;
+        let down_tree = experts_tree.subtree("down_projection")?;
+        let up_weights_tree = up_tree.subtree("weights")?;
+        let down_weights_tree = down_tree.subtree("weights")?;
+
+        let w13 = up_weights_tree
+            .leaf("weights")?
+            .validate(
+                &[moe_config.num_routed_experts, moe_config.expert_hidden_dim * 2, model_dim],
+                data_type,
+            )?
+            .read_allocation()?;
+        let w2 = down_weights_tree
+            .leaf("weights")?
+            .validate(
+                &[moe_config.num_routed_experts, model_dim, moe_config.expert_hidden_dim],
+                data_type,
+            )?
+            .read_allocation()?;
+        let up_biases = up_tree
+            .leaf("biases")?
+            .validate(&[moe_config.num_routed_experts, moe_config.expert_hidden_dim * 2], data_type)?
+            .read_allocation()?;
+        let down_biases = down_tree
+            .leaf("biases")?
+            .validate(&[moe_config.num_routed_experts, model_dim], data_type)?
+            .read_allocation()?;
+
+        let router_topk_kernel = <B::Kernels as Kernels>::MoeRouterTopKKernel::new(context, data_type)
             .map_err(MoeBlockError::BackendError)?;
         let counts_offsets_kernel = MoeCountsOffsetsFusedKernel::new(context).map_err(MoeBlockError::BackendError)?;
 
@@ -129,15 +174,6 @@ impl<B: Backend> MoeBlock<B> {
             MoeExpertsTwoPassPrefillBlock::new(context, data_type, gating_code).map_err(MoeBlockError::BackendError)?;
         let finalize_kernel =
             <B::Kernels as Kernels>::MoeFinalizeKernel::new(context, data_type).map_err(MoeBlockError::BackendError)?;
-
-        let experts_tree = parameter_tree.subtree("experts")?;
-        let up_tree = experts_tree.subtree("up_projection")?;
-        let down_tree = experts_tree.subtree("down_projection")?;
-
-        let w13 = up_tree.leaf_allocation("weights")?;
-        let w2 = down_tree.leaf_allocation("weights")?;
-        let up_biases = up_tree.leaf_allocation("biases")?;
-        let down_biases = down_tree.leaf_allocation("biases")?;
 
         let (gate_lo, gate_hi) = moe_config.expert_config.gate_clipping.unwrap_or_default();
         let (up_lo, up_hi) = moe_config.expert_config.up_clipping.unwrap_or_default();

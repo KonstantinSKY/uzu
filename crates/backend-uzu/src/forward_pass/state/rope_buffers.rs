@@ -13,6 +13,7 @@ pub struct RopeBuffers<B: Backend> {
     pub sines: Allocation<B>,
     max_sequence_length: usize,
     dim: usize,
+    data_type: DataType,
 }
 
 impl<B: Backend> RopeBuffers<B> {
@@ -20,14 +21,15 @@ impl<B: Backend> RopeBuffers<B> {
         context: &B::Context,
         max_sequence_length: usize,
         head_dim: usize,
-        data_type: DataType,
+        rope_data_type: DataType,
     ) -> Self {
         let shape = [max_sequence_length, head_dim];
         Self {
-            cosines: context.create_array_uninitialized(&shape, data_type).into_allocation(),
-            sines: context.create_array_uninitialized(&shape, data_type).into_allocation(),
+            cosines: context.create_array_uninitialized(&shape, rope_data_type).into_allocation(),
+            sines: context.create_array_uninitialized(&shape, rope_data_type).into_allocation(),
             max_sequence_length,
             dim: head_dim,
+            data_type: rope_data_type,
         }
     }
 
@@ -38,8 +40,17 @@ impl<B: Backend> RopeBuffers<B> {
     ) -> Result<(), Error> {
         let rope_tree =
             parameter_tree.subtree(&format!("ropes.{}", rope_index)).map_err(|_| Error::UnableToLoadWeights)?;
-        self.cosines = rope_tree.leaf_allocation("cosines").map_err(|_| Error::UnableToLoadWeights)?;
-        self.sines = rope_tree.leaf_allocation("sines").map_err(|_| Error::UnableToLoadWeights)?;
+        let cosines_leaf = rope_tree.leaf("cosines").map_err(|_| Error::UnableToLoadWeights)?;
+        let cosines_leaf = cosines_leaf
+            .validate(&[self.max_sequence_length, self.dim], self.data_type)
+            .map_err(|_| Error::UnableToLoadWeights)?;
+        self.cosines = cosines_leaf.read_allocation().map_err(|_| Error::UnableToLoadWeights)?;
+
+        let sines_leaf = rope_tree.leaf("sines").map_err(|_| Error::UnableToLoadWeights)?;
+        let sines_leaf = sines_leaf
+            .validate(&[self.max_sequence_length, self.dim], self.data_type)
+            .map_err(|_| Error::UnableToLoadWeights)?;
+        self.sines = sines_leaf.read_allocation().map_err(|_| Error::UnableToLoadWeights)?;
         Ok(())
     }
 

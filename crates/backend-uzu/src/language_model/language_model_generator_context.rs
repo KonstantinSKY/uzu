@@ -12,9 +12,12 @@ use crate::{
         Backend, Context, Kernels,
         kernel::{TokenCopySampledKernel, kv_cache_update::KVCacheUpdate},
     },
-    config::{LanguageModelConfig, ModelMetadata},
+    config::model::language_model::LanguageModelConfig,
     encodable_block::{Decoder, Sampling},
-    forward_pass::{cache_layers::CacheLayers, model_shape::ModelShape, state::SharedBuffers},
+    forward_pass::{
+        cache_layers::CacheLayers, config::decoder::DecoderForwardPassConfig, model_shape::ModelShape,
+        state::SharedBuffers,
+    },
     language_model::rng::PRng,
     parameters::ParameterLoader,
     session::{
@@ -101,6 +104,8 @@ pub struct LanguageModelGeneratorContext<B: Backend> {
 
     pub model_config: LanguageModelConfig,
     pub model_shape: ModelShape,
+    #[cfg(feature = "tracing")]
+    pub forward_pass_config: DecoderForwardPassConfig,
     pub executables: Decoder<B>,
     pub kv_cache_update: Box<KVCacheUpdate<B>>,
     pub gpu_sampler: Sampling<B>,
@@ -116,15 +121,13 @@ impl<B: Backend> LanguageModelGeneratorContext<B> {
     pub fn new(
         model_path: &Path,
         decoding_config: &DecodingConfig,
-        model_metadata: &ModelMetadata<LanguageModelConfig>,
+        model_config: &LanguageModelConfig,
     ) -> Result<Self, Error> {
         let context = B::Context::new().map_err(|e| Error::UnableToCreateContext(e.into()))?;
 
-        let model_shape = ModelShape::from_decoder_config(&model_metadata.model_config.model_config);
-
-        let prefill_step_size = decoding_config.prefill_step_size.resolve(&model_metadata.model_config);
+        let prefill_step_size = decoding_config.prefill_step_size.resolve(model_config);
         let generate_suffix_length = decoding_config.generate_suffix_length();
-        let max_prefix_length: usize = decoding_config.context_length.resolve(&model_metadata.model_config);
+        let max_prefix_length: usize = decoding_config.context_length.resolve(model_config);
         let max_suffix_length: usize = std::cmp::max(prefill_step_size, generate_suffix_length);
 
         let weights_path = model_path.join("model.safetensors");
@@ -133,23 +136,36 @@ impl<B: Backend> LanguageModelGeneratorContext<B> {
         }
         let weights_file = File::open(&weights_path).map_err(|_| Error::UnableToLoadWeights)?;
         let loader = ParameterLoader::new(&weights_file, context.as_ref()).map_err(|_| Error::UnableToLoadWeights)?;
-        let root_loader_view = loader.tree();
+        let root_loader_view = loader.tree().subtree("decoder").map_err(|_| Error::UnableToLoadWeights)?;
+        let model_shape = ModelShape::from_decoder_config(&model_config.decoder_config);
+        let forward_pass_config = DecoderForwardPassConfig::new_for_inference();
+        let activation_data_type = forward_pass_config.embedding_forward_pass_config.activation_data_type;
 
-        let mut shared_buffers = SharedBuffers::new(context.as_ref(), &model_metadata.model_config.model_config);
+        let mut shared_buffers = SharedBuffers::new(
+            context.as_ref(),
+            &model_config.decoder_config,
+            &forward_pass_config.transformer_forward_pass_config,
+        );
         shared_buffers.update_data(&root_loader_view)?;
         let shared_buffers = Rc::new(shared_buffers);
 
-        let executables = Decoder::new(context.as_ref(), &model_metadata.model_config.model_config, &root_loader_view);
+        let executables = Decoder::new(
+            context.as_ref(),
+            &model_config.decoder_config,
+            &root_loader_view,
+            &model_shape,
+            &forward_pass_config,
+        );
 
         let cache_layers = Rc::new(RefCell::new(CacheLayers::new(
             context.as_ref(),
             &model_shape,
+            activation_data_type,
             max_prefix_length,
             max_suffix_length,
         )));
 
-        let intermediate_data_type: DataType =
-            model_metadata.model_config.model_config.transformer_config.output_norm_config.scale_precision.into();
+        let intermediate_data_type = activation_data_type;
         let kv_cache_update = Box::new(
             KVCacheUpdate::new(context.as_ref(), intermediate_data_type, max_prefix_length)
                 .map_err(|e| Error::UnableToCreateContext(e.into()))?,
@@ -170,8 +186,10 @@ impl<B: Backend> LanguageModelGeneratorContext<B> {
             context,
             cache_layers,
             shared_buffers,
-            model_config: model_metadata.model_config.clone(),
+            model_config: model_config.clone(),
             model_shape,
+            #[cfg(feature = "tracing")]
+            forward_pass_config,
             executables,
             kv_cache_update,
             gpu_sampler,

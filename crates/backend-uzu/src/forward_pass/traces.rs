@@ -1,4 +1,5 @@
 use crate::{
+    DataType,
     array::{Array, ArrayContextExt},
     backends::common::Backend,
     forward_pass::model_shape::ModelShape,
@@ -7,9 +8,12 @@ use crate::{
 fn create_layer_results<B: Backend>(
     context: &B::Context,
     model_shape: &ModelShape,
+    activation_data_type: DataType,
     suffix_length: usize,
 ) -> Box<[LayerActivationTrace<B>]> {
-    (0..model_shape.num_layers).map(|_| LayerActivationTrace::new(context, model_shape, suffix_length)).collect()
+    (0..model_shape.num_layers)
+        .map(|_| LayerActivationTrace::new(context, model_shape, activation_data_type, suffix_length))
+        .collect()
 }
 
 pub struct LayerActivationTrace<B: Backend> {
@@ -28,10 +32,10 @@ impl<B: Backend> LayerActivationTrace<B> {
     pub fn new(
         context: &B::Context,
         model_shape: &ModelShape,
+        activation_data_type: DataType,
         suffix_length: usize,
     ) -> Self {
         let main_shape = model_shape.main_shape(suffix_length);
-        let activation_data_type = model_shape.activation_data_type();
         let main = || context.create_array_uninitialized(&main_shape, activation_data_type);
 
         Self {
@@ -60,11 +64,11 @@ impl<B: Backend> ActivationTrace<B> {
     pub fn new_llm(
         context: &B::Context,
         model_shape: &ModelShape,
+        activation_data_type: DataType,
         suffix_length: usize,
     ) -> Self {
-        let activation_data_type = model_shape.activation_data_type();
         let main_shape = model_shape.main_shape(suffix_length);
-        let layer_results = create_layer_results(context, model_shape, suffix_length);
+        let layer_results = create_layer_results(context, model_shape, activation_data_type, suffix_length);
 
         Self {
             embedding_norm: None,
@@ -78,12 +82,12 @@ impl<B: Backend> ActivationTrace<B> {
     pub fn new_classifier(
         context: &B::Context,
         model_shape: &ModelShape,
+        activation_data_type: DataType,
         suffix_length: usize,
         num_labels: usize,
     ) -> Self {
-        let activation_data_type = model_shape.activation_data_type();
         let main_shape = model_shape.main_shape(suffix_length);
-        let layer_results = create_layer_results(context, model_shape, suffix_length);
+        let layer_results = create_layer_results(context, model_shape, activation_data_type, suffix_length);
         let model_dim = model_shape.main_shape(1)[1];
 
         Self {

@@ -21,30 +21,9 @@ pub enum FullPrecisionLinearError<B: Backend> {
     #[error("Matmul error: {0}")]
     MatmulError(#[from] MatmulError<B>),
     #[error("Parameter loading error: {0}")]
-    ParameterError(ParameterLoaderError<B>),
+    ParameterError(#[from] ParameterLoaderError<B>),
     #[error("Unsupported data type for full precision linear kernel: {0:?}")]
     UnsupportedDataType(DataType),
-    #[error("Unexpected weights shape: got {got:?}, expected [{expected_output_dim}, {expected_input_dim}]")]
-    InvalidWeightsShape {
-        got: Box<[usize]>,
-        expected_output_dim: usize,
-        expected_input_dim: usize,
-    },
-    #[error("Weights dtype mismatch: got {got:?}, expected {expected:?}")]
-    InvalidWeightsDataType {
-        expected: DataType,
-        got: DataType,
-    },
-    #[error("Bias shape mismatch: got {got:?}, expected [{expected_output_dim}]")]
-    InvalidBiasShape {
-        got: Box<[usize]>,
-        expected_output_dim: usize,
-    },
-    #[error("Bias dtype mismatch: got {got:?}, expected {expected:?}")]
-    InvalidBiasDataType {
-        expected: DataType,
-        got: DataType,
-    },
 }
 
 pub struct FullPrecisionLinear<B: Backend> {
@@ -53,69 +32,40 @@ pub struct FullPrecisionLinear<B: Backend> {
     weights: Allocation<B>,
     input_dim: usize,
     output_dim: usize,
-    precision: DataType,
+    data_type: DataType,
 }
 
 impl<B: Backend> FullPrecisionLinear<B> {
     pub fn new(
         context: &B::Context,
-        precision: DataType,
         input_dim: usize,
         output_dim: usize,
+        data_type: DataType,
         parameter_tree: &ParameterTree<B::Context>,
     ) -> Result<Self, FullPrecisionLinearError<B>> {
-        if !matches!(precision, DataType::F16 | DataType::BF16 | DataType::F32) {
-            return Err(FullPrecisionLinearError::UnsupportedDataType(precision));
+        if !matches!(data_type, DataType::F16 | DataType::BF16 | DataType::F32) {
+            return Err(FullPrecisionLinearError::UnsupportedDataType(data_type));
         }
-
-        let weights_leaf = parameter_tree.leaf("weights").map_err(FullPrecisionLinearError::ParameterError)?;
-        let weights_shape = weights_leaf.shape().to_vec();
-        if weights_shape != [output_dim, input_dim] {
-            return Err(FullPrecisionLinearError::InvalidWeightsShape {
-                got: weights_shape.into_boxed_slice(),
-                expected_output_dim: output_dim,
-                expected_input_dim: input_dim,
-            });
-        }
-
-        if weights_leaf.data_type() != precision {
-            return Err(FullPrecisionLinearError::InvalidWeightsDataType {
-                expected: precision,
-                got: weights_leaf.data_type(),
-            });
-        }
+        let weights = parameter_tree
+            .subtree("weights")?
+            .leaf("weights")?
+            .validate(&[output_dim, input_dim], data_type)?
+            .read_allocation()?;
 
         let bias = match parameter_tree.leaf("biases") {
-            Ok(biases_leaf) => {
-                let bias_shape = biases_leaf.shape().to_vec();
-                if bias_shape != [output_dim] {
-                    return Err(FullPrecisionLinearError::InvalidBiasShape {
-                        got: bias_shape.into_boxed_slice(),
-                        expected_output_dim: output_dim,
-                    });
-                }
-
-                if biases_leaf.data_type() != precision {
-                    return Err(FullPrecisionLinearError::InvalidBiasDataType {
-                        expected: precision,
-                        got: biases_leaf.data_type(),
-                    });
-                }
-
-                Some(biases_leaf.read_allocation().map_err(FullPrecisionLinearError::ParameterError)?)
-            },
+            Ok(biases_leaf) => Some(biases_leaf.validate(&[output_dim], data_type)?.read_allocation()?),
             Err(_) => None,
         };
 
-        let kernel = <B::Kernels as ManualKernels>::MatmulKernel::new(context, precision)?;
+        let kernel = <B::Kernels as ManualKernels>::MatmulKernel::new(context, data_type)?;
 
         Ok(Self {
             kernel: RefCell::new(kernel),
             bias,
-            weights: weights_leaf.read_allocation().map_err(FullPrecisionLinearError::ParameterError)?,
+            weights,
             input_dim,
             output_dim,
-            precision,
+            data_type,
         })
     }
 }
@@ -127,7 +77,7 @@ impl<B: Backend> Linear<B> for FullPrecisionLinear<B> {
         batch_dim: usize,
         encoder: &mut Encoder<B>,
     ) -> Result<Allocation<B>, B::Error> {
-        let mut output = encoder.allocate_scratch(size_for_shape(&[batch_dim, self.output_dim], self.precision))?;
+        let mut output = encoder.allocate_scratch(size_for_shape(&[batch_dim, self.output_dim], self.data_type))?;
         self.kernel.borrow_mut().encode(
             MatmulArguments {
                 a: &input,

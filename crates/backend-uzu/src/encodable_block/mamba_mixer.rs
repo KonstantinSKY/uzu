@@ -14,7 +14,7 @@ use crate::{
             ssd_prefill::{SSDPrefillArguments, SSDPrefillKernels, SSDPrefillMode},
         },
     },
-    config::Mamba2Config,
+    config::token_mixer::mamba2::Mamba2Config,
     encodable_block::linear::{Linear, LinearBlockError},
     forward_pass::ssm_layer::SSMLayer,
     parameters::{ParameterLoaderError, ParameterTree},
@@ -82,38 +82,52 @@ impl<B: Backend> MambaMixer<B> {
         mamba_config: Mamba2Config,
         model_dim: usize,
         decoder_layer_loader: &ParameterTree<B::Context>,
+        data_type: DataType,
+        weights_data_type: DataType,
     ) -> Result<(Self, Option<Allocation<B>>), MambaMixerError<B>> {
         let split_tree = decoder_layer_loader.subtree("mixer")?;
         let conv_tree = split_tree.subtree("conv")?;
 
-        let data_type: DataType = mamba_config.in_projection_config.activation_precision().into();
-
         let (in_projection, in_projection_input_hadamard_factors) = <dyn Linear<B>>::new_extracting_input_hadamard(
-            &mamba_config.in_projection_config,
             model_dim,
             [mamba_config.conv_dim(), mamba_config.inner_dim(), mamba_config.num_heads],
             context,
+            weights_data_type,
             &decoder_layer_loader.subtree("mixer.in_projection")?,
         )
         .map_err(|err| MambaMixerError::LinearError(Box::new(err)))?;
 
         let out_projection = <dyn Linear<B>>::new(
-            &mamba_config.out_projection_config,
             mamba_config.inner_dim(),
             [model_dim],
             context,
+            weights_data_type,
             &decoder_layer_loader.subtree("mixer.out_projection")?,
         )
         .map_err(|err| MambaMixerError::LinearError(Box::new(err)))?;
 
-        let conv_weight = conv_tree.leaf("weights")?.read_allocation()?;
+        let conv_weight = conv_tree
+            .leaf("weights")?
+            .validate(&[mamba_config.conv_dim(), mamba_config.kernel_size], data_type)?
+            .read_allocation()?;
         let conv_bias = if mamba_config.conv_config.has_biases {
-            Some(conv_tree.leaf("biases")?.read_allocation()?)
+            Some(
+                conv_tree
+                    .leaf("biases")?
+                    .validate(&[mamba_config.conv_dim()], data_type)?
+                    .read_allocation()?,
+            )
         } else {
             None
         };
-        let gate_bias = split_tree.leaf("gate_bias")?.read_allocation()?;
-        let skip_connection_weight = split_tree.leaf("skip_connection_weight")?.read_allocation()?;
+        let gate_bias = split_tree
+            .leaf("gate_bias")?
+            .validate(&[mamba_config.inner_dim()], data_type)?
+            .read_allocation()?;
+        let skip_connection_weight = split_tree
+            .leaf("skip_connection_weight")?
+            .validate(&[mamba_config.num_heads], data_type)?
+            .read_allocation()?;
 
         let split_inproj = <B::Kernels as Kernels>::SplitInProjKernel::new(context, data_type)
             .map_err(MambaMixerError::BackendError)?;

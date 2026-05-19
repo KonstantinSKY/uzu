@@ -14,7 +14,7 @@ use crate::{
         Allocation, AsBufferRangeRef, Backend, CommandBuffer, Context, DenseBuffer, Encoder, Pending,
         kernel::TokenCopySampledKernel,
     },
-    config::{LanguageModelConfig, ModelMetadata},
+    config::model::language_model::LanguageModelConfig,
     encodable_block::{DecoderDecodeInput, SamplingArguments, SamplingInputs},
     forward_pass::{cache_layers::CacheLayersSlice, kv_cache_layer::INVALID_POSITION, token_inputs::TokenInputs},
     language_model::grammar::CompiledGrammar,
@@ -653,11 +653,11 @@ impl<B: Backend> LanguageModelGenerator<B> {
     pub fn new(
         model_path: &Path,
         decoding_config: DecodingConfig,
-        model_metadata: &ModelMetadata<LanguageModelConfig>,
+        model_config: &LanguageModelConfig,
     ) -> Result<Self, Error> {
         let gpu_capture = GpuCaptureManager::new();
 
-        let context = LanguageModelGeneratorContext::new(model_path, &decoding_config, model_metadata)?;
+        let context = LanguageModelGeneratorContext::new(model_path, &decoding_config, model_config)?;
 
         Ok(Self {
             decoding_config,
@@ -785,7 +785,7 @@ impl<B: Backend> LanguageModelGenerator<B> {
                     output: sampling_output.as_mut().expect("Sampling requires output allocation"),
                     sampling_method: sampling_method.expect("Sampling requires method"),
                     batch_size: sampling_length,
-                    vocab_size: context.model_config.model_config.vocab_size,
+                    vocab_size: context.model_config.decoder_config.vocab_size,
                 },
                 encoder,
             );

@@ -1,36 +1,14 @@
 use super::*;
-
-pub(super) fn resolve_descript_audio_codec_vocoder_data_type(
-    top_level_precision: DataType,
-    config: &DescriptAudioCodecConfig,
-) -> AudioResult<DataType> {
-    let resolved_precision = top_level_precision;
-    for (field_name, precision) in [
-        ("tts_config.audio_decoder_config.precision", config.precision),
-        ("tts_config.audio_decoder_config.quantizer_config.precision", config.quantizer_config.precision),
-    ] {
-        if resolved_precision != precision {
-            return Err(AudioError::Runtime(format!(
-                "conflicting DescriptAudioCodec precision in Lalamo export: {field_name}={precision:?} conflicts with {resolved_precision:?}"
-            )));
-        }
-    }
-
-    let data_type: DataType = resolved_precision.into();
-    if !matches!(data_type, DataType::F32 | DataType::F16 | DataType::BF16) {
-        return Err(AudioError::Runtime(format!(
-            "unsupported DescriptAudioCodec vocoder precision in Lalamo export: {resolved_precision:?} (expected float32/float16/bfloat16)"
-        )));
-    }
-    Ok(data_type)
-}
+use crate::parameters::read_safetensors_metadata;
 
 pub(super) fn load_audio_runtime_from_tts_config(
-    tts_config: &TtsConfig,
+    tts_config: &TTSConfig,
     model_path: &Path,
 ) -> AudioResult<(RuntimeConfigJson, StructuredAudioCodecGraph)> {
-    let cfg = match &tts_config.audio_decoder_config {
-        TtsAudioDecoderConfig::DescriptAudioCodec(config) => config,
+    let AnyTTSAudioDecoderConfig::DescriptAudioCodecConfig(cfg) = &tts_config.audio_decoder_config else {
+        return Err(AudioError::Runtime(
+            "only DescriptAudioCodecConfig audio decoder is supported by this runtime".to_string(),
+        ));
     };
     let fishaudio_weights = model_path.join("model.safetensors");
     if !fishaudio_weights.is_file() {
@@ -40,7 +18,20 @@ pub(super) fn load_audio_runtime_from_tts_config(
         )));
     }
 
-    let vocoder_data_type = resolve_descript_audio_codec_vocoder_data_type(tts_config.activation_precision, cfg)?;
+    let weights_file = File::open(&fishaudio_weights)
+        .map_err(|err| AudioError::Runtime(format!("failed to open '{}': {err}", fishaudio_weights.display())))?;
+    let (_, metadata) = read_safetensors_metadata(&weights_file)
+        .map_err(|err| AudioError::Runtime(format!("failed to read safetensors metadata: {err}")))?;
+    let vocoder_data_type = metadata
+        .tensors
+        .get("audio_decoder.decoder.first_conv.weights")
+        .ok_or_else(|| {
+            AudioError::Runtime(
+                "missing audio_decoder.decoder.first_conv.weights in exported FishAudio weights".to_string(),
+            )
+        })?
+        .dtype
+        .into();
 
     let total_codebooks = cfg
         .n_codebooks

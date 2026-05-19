@@ -18,7 +18,7 @@ use crate::{
             matmul::{MatmulArgumentC, MatmulArguments, MatmulKernel},
         },
     },
-    config::AttentionConfig,
+    config::token_mixer::attention::AttentionConfig,
     forward_pass::{
         cache_layers::LayerCacheAccess,
         kv_cache_layer::{KVCacheLayer, KVCacheLayerState},

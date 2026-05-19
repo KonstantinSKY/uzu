@@ -6,7 +6,7 @@ use super::{ClassificationOutput, ClassificationStats, ClassifierContext};
 use crate::{
     DataType, allocation_to_vec,
     backends::common::{Allocation, AsBufferRangeRef, Backend, Encoder},
-    config::{ClassifierModelConfig, ModelMetadata},
+    config::model::classifier_model::ClassifierModelConfig,
     encodable_block::LayerArguments,
     forward_pass::token_inputs::TokenInputs,
     session::types::Error,
@@ -67,9 +67,9 @@ impl<B: Backend> ClassifierTrait for Classifier<B> {
 impl<B: Backend> Classifier<B> {
     pub fn new(
         model_path: &Path,
-        model_metadata: &ModelMetadata<ClassifierModelConfig>,
+        model_config: &ClassifierModelConfig,
     ) -> Result<Self, Error> {
-        let context = ClassifierContext::new(model_path, model_metadata)?;
+        let context = ClassifierContext::new(model_path, model_config)?;
         Ok(Self {
             context,
         })
@@ -81,10 +81,11 @@ impl<B: Backend> Classifier<B> {
         token_ids: &[u64],
         token_positions: &[usize],
     ) -> Result<(Box<[f32]>, ActivationTrace<B>), Error> {
-        let num_labels = self.context.model_config.model_config.num_labels;
+        let num_labels = self.context.model_config.classifier_config.num_labels;
         let mut traces = ActivationTrace::new_classifier(
             self.context.context.as_ref(),
             &self.context.model_shape,
+            self.context.forward_pass_config.embedding_forward_pass_config.activation_data_type,
             token_ids.len(),
             num_labels,
         );
@@ -211,10 +212,7 @@ impl<B: Backend> Classifier<B> {
         &self,
         logits: &Allocation<B>,
     ) -> Result<Box<[f32]>, Error> {
-        let logits_data_type: DataType =
-            self.context.model_config.model_config.prediction_head_config.readout_config.activation_precision().into();
-
-        match logits_data_type {
+        match self.context.logits_data_type {
             DataType::F32 => Ok(allocation_to_vec::<B, f32>(logits).into()),
             DataType::F16 => {
                 Ok(allocation_to_vec::<B, half::f16>(logits).into_iter().map(|x| x.to_f32()).collect::<Box<[_]>>())
@@ -230,7 +228,7 @@ impl<B: Backend> Classifier<B> {
         &self,
         logits: &[f32],
     ) -> Result<HashMap<String, f32>, Error> {
-        let output_labels = &self.context.model_config.model_config.output_labels;
+        let output_labels = &self.context.model_config.classifier_config.output_labels;
         let mut probabilities = HashMap::new();
 
         for (idx, &logit) in logits.iter().enumerate() {

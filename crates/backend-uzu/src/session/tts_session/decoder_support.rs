@@ -445,10 +445,10 @@ impl<B: Backend + Send + Sync> TtsSession<B> {
             return Err(Error::UnableToLoadConfig);
         }
         let config_file = File::open(&config_path).map_err(|_| Error::UnableToLoadConfig)?;
-        let model_metadata: ModelMetadata<TtsModelConfig> =
+        let model_config: TTSModelConfig =
             serde_json::from_reader(std::io::BufReader::new(config_file)).map_err(|_| Error::UnableToLoadConfig)?;
 
-        Self::from_model_metadata_with_options(model_path, model_metadata, options)
+        Self::from_model_config_with_options(model_path, model_config, options)
     }
 
     pub fn last_execution_stats(&self) -> Option<TtsExecutionStats> {
@@ -459,9 +459,9 @@ impl<B: Backend + Send + Sync> TtsSession<B> {
         self.audio.sample_rate()
     }
 
-    fn from_model_metadata_with_options(
+    fn from_model_config_with_options(
         model_path: PathBuf,
-        model_metadata: ModelMetadata<TtsModelConfig>,
+        model_config: TTSModelConfig,
         options: TtsSessionOptions,
     ) -> Result<Self, Error> {
         let tokenizer_path = model_path.join("tokenizer.json");
@@ -470,13 +470,13 @@ impl<B: Backend + Send + Sync> TtsSession<B> {
         }
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|_| Error::UnableToLoadTokenizer)?;
 
-        let loaded_runtime = load_tts_runtime(&model_path, &model_metadata, &options)?;
+        let loaded_runtime = load_tts_runtime(&model_path, &model_config, &options)?;
 
         Ok(Self {
             tokenizer,
             audio: loaded_runtime.audio,
             audio_decoder: loaded_runtime.audio_decoder,
-            message_processor_config: loaded_runtime.message_processor_config,
+            token_codec_config: loaded_runtime.token_codec_config,
             text_decoder: loaded_runtime.text_decoder,
             last_execution_stats: None,
         })
@@ -489,13 +489,13 @@ impl<B: Backend + Send + Sync> TtsSession<B> {
         let messages = input
             .get_messages()
             .into_iter()
-            .map(|message| message.resolve(&self.message_processor_config))
+            .map(|message| message.resolve(&self.token_codec_config))
             .collect::<Vec<_>>();
 
         let template_name = "tts_prompt_template";
         let mut environment = Environment::new();
         environment
-            .add_template(template_name, self.message_processor_config.prompt_template.as_str())
+            .add_template(template_name, self.token_codec_config.prompt_template.as_str())
             .map_err(|_| Error::UnableToLoadPromptTemplate)?;
         let template = environment.get_template(template_name).map_err(|_| Error::UnableToLoadPromptTemplate)?;
 
@@ -507,44 +507,43 @@ impl<B: Backend + Send + Sync> TtsSession<B> {
 
         Ok(normalize_rendered_prompt(
             result,
-            self.message_processor_config.prompt_template.as_str(),
-            self.message_processor_config.drop_initial_newline,
+            self.token_codec_config.prompt_template.as_str(),
+            self.token_codec_config.drop_initial_newline,
         ))
     }
 }
 
 pub(super) fn semantic_token_to_code(
     semantic_token: u64,
-    semantic_begin: i64,
-    semantic_end: i64,
+    semantic_begin: u64,
+    semantic_end: u64,
     token_upper_bound: usize,
 ) -> u32 {
     if semantic_begin > semantic_end || token_upper_bound == 0 {
         return 0;
     }
 
-    let semantic = semantic_token as i64;
-    if semantic < semantic_begin || semantic > semantic_end {
+    if semantic_token < semantic_begin || semantic_token > semantic_end {
         return 0;
     }
 
-    let relative = usize::try_from(semantic - semantic_begin).unwrap_or(0);
+    let relative = usize::try_from(semantic_token - semantic_begin).unwrap_or(0);
     let clamped = relative.min(token_upper_bound.saturating_sub(1));
     u32::try_from(clamped).unwrap_or(0)
 }
 
 pub(super) fn build_semantic_sampling_mask_row(
     vocab_size: usize,
-    semantic_begin: i64,
-    semantic_end: i64,
-    im_end: i64,
+    semantic_begin: u64,
+    semantic_end: u64,
+    im_end: u64,
 ) -> Result<Box<[u32]>, Error> {
     if vocab_size == 0 || semantic_begin > semantic_end {
         return Err(Error::UnableToLoadConfig);
     }
 
-    let max_token_id = i64::try_from(vocab_size.saturating_sub(1)).map_err(|_| Error::UnableToLoadConfig)?;
-    if semantic_begin < 0 || semantic_end < 0 || semantic_end > max_token_id || im_end < 0 || im_end > max_token_id {
+    let max_token_id = u64::try_from(vocab_size.saturating_sub(1)).map_err(|_| Error::UnableToLoadConfig)?;
+    if semantic_end > max_token_id || im_end > max_token_id {
         return Err(Error::UnableToLoadConfig);
     }
 
@@ -563,11 +562,8 @@ pub(super) fn build_semantic_sampling_mask_row(
 
 pub(super) fn clear_token_in_sampling_mask(
     mask: &mut [u32],
-    token: i64,
+    token: u64,
 ) -> Result<(), Error> {
-    if token < 0 {
-        return Err(Error::UnableToLoadConfig);
-    }
     let token = usize::try_from(token).map_err(|_| Error::UnableToLoadConfig)?;
     let word = token / 32;
     if word >= mask.len() {

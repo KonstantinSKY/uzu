@@ -6,9 +6,12 @@ use super::{LayerNorm, LayerNormError, PostLayerScalar, RMSNorm, RMSNormError};
 use crate::{
     DataType,
     backends::common::{Allocation, Backend, Encoder},
-    config::NormalizationConfig,
+    config::normalization::NormalizationConfig,
+    forward_pass::config::normalization::NormalizationForwardPassConfig,
     parameters::ParameterTree,
 };
+
+pub(crate) const NORMALIZATION_SCALE_DATA_TYPE: DataType = DataType::F32;
 
 #[derive(Debug, Error)]
 pub enum NormalizationError<B: Backend> {
@@ -30,15 +33,26 @@ impl<B: Backend> Normalization<B> {
     pub fn new(
         context: &B::Context,
         intermediate_data_type: DataType,
+        element_count: usize,
+        forward_pass_config: &NormalizationForwardPassConfig,
         config: NormalizationConfig,
         parameter_tree: &ParameterTree<B::Context>,
     ) -> Result<Self, NormalizationError<B>> {
         if config.subtract_mean {
-            Ok(Self::LayerNorm(LayerNorm::new(context, intermediate_data_type, config, parameter_tree)?))
+            Ok(Self::LayerNorm(LayerNorm::new(
+                context,
+                intermediate_data_type,
+                element_count,
+                forward_pass_config,
+                config,
+                parameter_tree,
+            )?))
         } else {
             Ok(Self::RMSNorm(RMSNorm::new(
                 context,
                 intermediate_data_type,
+                element_count,
+                forward_pass_config,
                 config,
                 parameter_tree,
                 None,

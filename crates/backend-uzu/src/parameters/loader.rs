@@ -8,10 +8,11 @@ use thiserror::Error;
 use super::safetensors_metadata::{HashMetadata as STMetadata, HeaderLoadingError, read_metadata as read_st_metadata};
 use crate::{
     ArrayElement, DataType,
-    array::{Array, ArrayContextExt},
     backends::common::{Allocation, AllocationType, AsBufferRangeRef, Backend, Context, DenseBuffer},
-    utils::fs::file_read_exact_at,
+    utils::{fs::file_read_exact_at, strict_serde::DeserializeStrictOwned},
 };
+
+// TODO: This entire file (and siblings) are utter garbage, rewrite
 
 pub struct ParameterMetadata {
     shape: Box<[usize]>,
@@ -20,26 +21,29 @@ pub struct ParameterMetadata {
     size: usize,
 }
 
-fn st_metadata_into_index(
+fn st_metadata_into_index_metadata(
     global_offset: usize,
     st_metadata: STMetadata,
-) -> HashMap<String, ParameterMetadata> {
-    st_metadata
-        .tensors
-        .into_iter()
-        .map(|(key, value)| {
-            let (local_begin, local_end) = value.data_offsets;
-            let actual_local_offset = local_begin;
-            let actual_size = local_end - local_begin;
-            let weight_metadata = ParameterMetadata {
-                shape: value.shape.into(),
-                data_type: value.dtype.into(),
-                offset: global_offset + actual_local_offset,
-                size: actual_size,
-            };
-            (key, weight_metadata)
-        })
-        .collect()
+) -> (HashMap<String, ParameterMetadata>, HashMap<String, String>) {
+    (
+        st_metadata
+            .tensors
+            .into_iter()
+            .map(|(key, value)| {
+                let (local_begin, local_end) = value.data_offsets;
+                let actual_local_offset = local_begin;
+                let actual_size = local_end - local_begin;
+                let weight_metadata = ParameterMetadata {
+                    shape: value.shape.into(),
+                    data_type: value.dtype.into(),
+                    offset: global_offset + actual_local_offset,
+                    size: actual_size,
+                };
+                (key, weight_metadata)
+            })
+            .collect(),
+        st_metadata.metadata.unwrap_or_default(),
+    )
 }
 
 #[derive(Debug, Error)]
@@ -48,20 +52,12 @@ pub enum ParameterLoaderError<B: Backend> {
     KeyNotFound(String),
     #[error("Couldn't find any arrays with prefix \"{0}\".")]
     SubtreeNotFound(String),
-    #[error(
-        "Size mismatch: array of shape {shape:?} and data type \
-        {data_type:?} expected to be {expected_size} bytes, got {actual_size} bytes."
-    )]
-    SizeMismatch {
-        data_type: DataType,
-        shape: Box<[usize]>,
-        expected_size: usize,
-        actual_size: usize,
-    },
     #[error("Backend error: {0}")]
     BackendError(#[source] B::Error),
     #[error("Failed to read data")]
     ArrayLoadingError(#[from] std::io::Error),
+    #[error("Failed to deserialize metadata")]
+    MetadataDeserializationError(#[from] serde_json::Error),
     #[error("Invalid tensor: got {shape:?} @ {data_type:?}, expected {expected_shape:?} @ {expected_data_type:?}")]
     InvalidTensor {
         shape: Box<[usize]>,
@@ -77,6 +73,7 @@ where
 {
     context: &'context C,
     index: HashMap<String, ParameterMetadata>,
+    metadata: HashMap<String, String>,
     file: &'file File,
 }
 
@@ -89,11 +86,12 @@ where
         context: &'context C,
     ) -> Result<Self, HeaderLoadingError> {
         let (global_offset, st_metadata) = read_st_metadata(file)?;
-        let index = st_metadata_into_index(global_offset, st_metadata);
+        let (index, metadata) = st_metadata_into_index_metadata(global_offset, st_metadata);
         Ok(ParameterLoader {
             context,
-            file,
             index,
+            metadata,
+            file,
         })
     }
 
@@ -104,45 +102,11 @@ where
     fn get_leaf<'leaf>(
         &'leaf self,
         key: &str,
-    ) -> Result<ParameterLeaf<'file, 'context, 'leaf, C>, ParameterLoaderError<C::Backend>> {
+    ) -> Result<ParameterLeaf<'file, 'context, 'leaf, C, false>, ParameterLoaderError<C::Backend>> {
         Ok(ParameterLeaf {
             metadata: self.index.get(key).ok_or_else(|| ParameterLoaderError::KeyNotFound(key.to_string()))?,
             loader: self,
         })
-    }
-
-    fn get(
-        &self,
-        key: &str,
-    ) -> Result<Array<C::Backend>, ParameterLoaderError<C::Backend>> {
-        let metadata_entry = self.index.get(key).ok_or(ParameterLoaderError::KeyNotFound(key.to_string()))?;
-        let (offset, size) = (metadata_entry.offset, metadata_entry.size);
-        let mut array = self.context.create_array_uninitialized(&metadata_entry.shape, metadata_entry.data_type);
-        if array.size() != size {
-            return Err(ParameterLoaderError::SizeMismatch {
-                data_type: metadata_entry.data_type,
-                shape: metadata_entry.shape.to_owned(),
-                expected_size: array.size(),
-                actual_size: size,
-            });
-        }
-
-        file_read_exact_at(self.file, array.as_bytes_mut(), offset as u64)?;
-        Ok(array)
-    }
-
-    pub fn read_extract_at(
-        &self,
-        key: &str,
-        buf: &mut [u8],
-        shape: &mut Box<[usize]>,
-        data_type: &mut DataType,
-    ) -> Result<(), ParameterLoaderError<C::Backend>> {
-        let metadata_entry = self.index.get(key).ok_or(ParameterLoaderError::KeyNotFound(key.to_string()))?;
-        file_read_exact_at(self.file, buf, metadata_entry.offset as u64)?;
-        *shape = metadata_entry.shape.to_owned();
-        *data_type = metadata_entry.data_type;
-        Ok(())
     }
 
     pub fn tree<'loader>(&'loader self) -> ParameterTree<'loader, C> {
@@ -153,31 +117,19 @@ where
     }
 }
 
-pub struct ParameterLeaf<'file, 'context, 'leaf, C: Context> {
+pub struct ParameterLeaf<'file, 'context, 'leaf, C: Context, const VALIDATED: bool> {
     metadata: &'leaf ParameterMetadata,
     loader: &'leaf ParameterLoader<'context, 'file, C>,
 }
 
-impl<'file, 'context, 'leaf, C: Context> ParameterLeaf<'file, 'context, 'leaf, C> {
-    pub fn shape(&self) -> &[usize] {
-        &self.metadata.shape
-    }
-
-    pub fn data_type(&self) -> DataType {
-        self.metadata.data_type
-    }
-
-    pub fn size(&self) -> usize {
-        self.metadata.size
-    }
-
-    pub fn validate_shape(
-        &self,
+impl<'file, 'context, 'leaf, C: Context> ParameterLeaf<'file, 'context, 'leaf, C, false> {
+    pub fn validate(
+        self,
         expected_shape: &[usize],
         expected_data_type: DataType,
-    ) -> Result<(), ParameterLoaderError<C::Backend>> {
-        let shape = self.shape();
-        let data_type = self.data_type();
+    ) -> Result<ParameterLeaf<'file, 'context, 'leaf, C, true>, ParameterLoaderError<C::Backend>> {
+        let shape = self.metadata.shape.as_ref();
+        let data_type = self.metadata.data_type;
         if (shape, data_type) != (expected_shape, expected_data_type) {
             return Err(ParameterLoaderError::InvalidTensor {
                 shape: shape.into(),
@@ -186,9 +138,22 @@ impl<'file, 'context, 'leaf, C: Context> ParameterLeaf<'file, 'context, 'leaf, C
                 expected_data_type,
             });
         }
-        Ok(())
+        Ok(ParameterLeaf {
+            metadata: self.metadata,
+            loader: self.loader,
+        })
     }
 
+    #[cfg(test)]
+    pub fn unvalidated(self) -> ParameterLeaf<'file, 'context, 'leaf, C, true> {
+        ParameterLeaf {
+            metadata: self.metadata,
+            loader: self.loader,
+        }
+    }
+}
+
+impl<'file, 'context, 'leaf, C: Context> ParameterLeaf<'file, 'context, 'leaf, C, true> {
     pub fn read_slice<T: ArrayElement>(&self) -> Result<Box<[T]>, ParameterLoaderError<C::Backend>> {
         let element_count = self.metadata.size / std::mem::size_of::<T>();
         let mut data = vec![T::zeroed(); element_count];
@@ -251,34 +216,21 @@ impl<'loader, C: Context> ParameterTree<'loader, C> {
         }
     }
 
-    pub fn leaf_array(
-        &self,
-        name: &str,
-    ) -> Result<Array<C::Backend>, ParameterLoaderError<C::Backend>> {
-        self.loader.get(&self.join_prefix(name))
-    }
-
     pub fn leaf<'leaf>(
         &'leaf self,
         name: &str,
-    ) -> Result<ParameterLeaf<'loader, 'loader, 'leaf, C>, ParameterLoaderError<C::Backend>> {
+    ) -> Result<ParameterLeaf<'loader, 'loader, 'leaf, C, false>, ParameterLoaderError<C::Backend>> {
         self.loader.get_leaf(&self.join_prefix(name))
     }
 
-    pub fn leaf_allocation(
+    pub fn metadata<T: DeserializeStrictOwned>(
         &self,
         name: &str,
-    ) -> Result<Allocation<C::Backend>, ParameterLoaderError<C::Backend>> {
-        self.leaf(name)?.read_allocation()
-    }
+    ) -> Result<T, ParameterLoaderError<C::Backend>> {
+        let new_prefix = self.join_prefix(name);
 
-    pub fn read_extract_at(
-        &self,
-        name: &str,
-        buf: &mut [u8],
-        shape: &mut Box<[usize]>,
-        data_type: &mut DataType,
-    ) -> Result<(), ParameterLoaderError<C::Backend>> {
-        self.loader.read_extract_at(&self.join_prefix(name), buf, shape, data_type)
+        Ok(serde_json::from_str(
+            self.loader.metadata.get(&new_prefix).ok_or(ParameterLoaderError::KeyNotFound(new_prefix))?,
+        )?)
     }
 }

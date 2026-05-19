@@ -13,9 +13,9 @@ use std::{
 
 use backend_uzu::{
     Array, ArrayElement, DataType, allocation_to_vec,
-    backends::common::{Allocation, Backend, Encoder, kernel::kv_cache_update::KVCacheUpdate},
+    backends::common::{Allocation, AllocationType, Backend, Context, Encoder, kernel::kv_cache_update::KVCacheUpdate},
     classifier::Classifier,
-    config::{ModelConfig, ModelMetadata, ModelType},
+    config::model::AnyModelConfig,
     encodable_block::{DecoderDecodeInput, Sampling},
     forward_pass::{
         cache_layers::CacheLayers, kv_cache_layer::KVCacheLayer, token_inputs::TokenInputs, traces::ActivationTrace,
@@ -24,7 +24,7 @@ use backend_uzu::{
         language_model_generator_context::LanguageModelGeneratorContext,
         sampler::{ArgmaxSampler, LogitsSampler},
     },
-    parameters::{ParameterLoader, ParameterTree, read_safetensors_metadata},
+    parameters::{ParameterLoader, ParameterLoaderError, ParameterTree, read_safetensors_metadata},
     session::{
         config::{DecodingConfig, SpeculatorConfig},
         parameter::{AsyncBatchSize, ConfigResolvableValue, ContextLength, ContextMode, PrefillStepSize, SamplingSeed},
@@ -174,46 +174,14 @@ impl<B: Backend> TraceValidator<B> {
         }
 
         let config_file = File::open(&config_path).map_err(|_| Error::UnableToLoadConfig)?;
-        let raw_metadata: ModelMetadata<ModelConfig> =
+        let model_config: AnyModelConfig =
             serde_json::from_reader(std::io::BufReader::new(config_file)).map_err(|_| Error::UnableToLoadConfig)?;
 
-        let context = match raw_metadata.model_type.clone() {
-            ModelType::ClassifierModel => {
-                let ModelConfig::ClassifierModel(model_config) = raw_metadata.model_config.clone() else {
-                    return Err(Error::UnableToLoadConfig);
-                };
-                let metadata = ModelMetadata {
-                    toolchain_version: raw_metadata.toolchain_version,
-                    vendor: raw_metadata.vendor,
-                    family: raw_metadata.family,
-                    name: raw_metadata.name,
-                    size: raw_metadata.size,
-                    quantization: raw_metadata.quantization,
-                    repo: raw_metadata.repo,
-                    use_cases: raw_metadata.use_cases,
-                    model_type: raw_metadata.model_type,
-                    model_config,
-                    grammar_start_tokens: raw_metadata.grammar_start_tokens,
-                };
-                ModelContext::Classifier(Classifier::new(model_path, &metadata)?)
+        let context = match model_config {
+            AnyModelConfig::ClassifierModelConfig(model_config) => {
+                ModelContext::Classifier(Classifier::new(model_path, &model_config)?)
             },
-            ModelType::LanguageModel => {
-                let ModelConfig::LanguageModel(model_config) = raw_metadata.model_config.clone() else {
-                    return Err(Error::UnableToLoadConfig);
-                };
-                let metadata = ModelMetadata {
-                    toolchain_version: raw_metadata.toolchain_version,
-                    vendor: raw_metadata.vendor,
-                    family: raw_metadata.family,
-                    name: raw_metadata.name,
-                    size: raw_metadata.size,
-                    quantization: raw_metadata.quantization,
-                    repo: raw_metadata.repo,
-                    use_cases: raw_metadata.use_cases,
-                    model_type: raw_metadata.model_type,
-                    model_config,
-                    grammar_start_tokens: raw_metadata.grammar_start_tokens,
-                };
+            AnyModelConfig::LanguageModelConfig(model_config) => {
                 let prefill_step_size = Self::determine_prefill_step_size(model_path);
                 let decoding_config = DecodingConfig::new(
                     ContextMode::default(),
@@ -223,12 +191,12 @@ impl<B: Backend> TraceValidator<B> {
                     SamplingSeed::default(),
                     AsyncBatchSize::default(),
                 );
-                let mut llm_context = LanguageModelGeneratorContext::new(model_path, &decoding_config, &metadata)?;
+                let mut llm_context = LanguageModelGeneratorContext::new(model_path, &decoding_config, &model_config)?;
                 let desired_suffix_length = prefill_step_size.max(decoding_config.generate_suffix_length());
                 Self::ensure_llm_context_capacity(&decoding_config, desired_suffix_length, &mut llm_context);
                 ModelContext::LanguageModelGenerator(llm_context)
             },
-            ModelType::TtsModel => return Err(Error::UnableToLoadConfig),
+            AnyModelConfig::TTSModelConfig(_) => return Err(Error::UnableToLoadConfig),
         };
 
         Ok(Self {
@@ -259,12 +227,26 @@ impl<B: Backend> TraceValidator<B> {
         traces_path: &Path,
     ) -> Result<TracerValidationResults, Error> {
         let traces_file = File::open(traces_path).map_err(|_| Error::UnableToLoadWeights)?;
+        let (_header_len, traces_metadata) =
+            read_safetensors_metadata(&traces_file).map_err(|_| Error::UnableToLoadWeights)?;
+        let token_shape = traces_metadata
+            .tensors
+            .get("activation_trace.token_ids")
+            .map(|tensor| tensor.shape.clone())
+            .ok_or(Error::UnableToLoadWeights)?;
+        let position_shape = traces_metadata
+            .tensors
+            .get("activation_trace.token_positions")
+            .map(|tensor| tensor.shape.clone())
+            .ok_or(Error::UnableToLoadWeights)?;
+
         let traces_loader =
             ParameterLoader::new(&traces_file, ctx.context.as_ref()).map_err(|_| Error::UnableToLoadWeights)?;
         let traces_view = traces_loader.tree();
 
-        let token_ids = Self::load_array_as_vec::<i32, u64>(&traces_view, "activation_trace.token_ids");
-        let token_positions = Self::load_array_as_vec::<i32, usize>(&traces_view, "activation_trace.token_positions");
+        let token_ids = Self::load_array_as_vec::<i32, u64>(&traces_view, "activation_trace.token_ids", &token_shape);
+        let token_positions =
+            Self::load_array_as_vec::<i32, usize>(&traces_view, "activation_trace.token_positions", &position_shape);
         let token_inputs = TokenInputs::new_llm(
             ctx.context.as_ref(),
             &ctx.model_shape,
@@ -276,7 +258,12 @@ impl<B: Backend> TraceValidator<B> {
             /*sampling_start=*/ 0,
             /*sampling_length=*/ token_ids.len(),
         );
-        let mut traces = ActivationTrace::new_llm(ctx.context.as_ref(), &ctx.model_shape, token_ids.len());
+        let mut traces = ActivationTrace::new_llm(
+            ctx.context.as_ref(),
+            &ctx.model_shape,
+            ctx.forward_pass_config.embedding_forward_pass_config.activation_data_type,
+            token_ids.len(),
+        );
 
         let mut encoder =
             Encoder::<B>::new(ctx.context.as_ref()).map_err(|e| Error::UnableToCreateCommandBuffer(e.into()))?;
@@ -303,7 +290,7 @@ impl<B: Backend> TraceValidator<B> {
         let pending = encoder.end_encoding().submit();
         pending.wait_until_completed().map_err(|e| Error::CommandBufferFailed(Box::new(e)))?;
 
-        let data_type = ctx.model_shape.activation_data_type();
+        let data_type = ctx.forward_pass_config.embedding_forward_pass_config.activation_data_type;
 
         // Common layer validation
         let mut results = Self::validate_layer_traces(&traces, &traces_view, data_type);
@@ -315,10 +302,23 @@ impl<B: Backend> TraceValidator<B> {
                 continue;
             };
 
-            if let Ok(expected) = traces_view.leaf_array(&format!("updated_kv_cache.{}.keys", index)) {
-                let size = kv.shape().iter().product::<usize>() * data_type.size_in_bytes();
+            let shape = kv.shape();
+            if let Ok(expected) =
+                Self::read_array(&traces_view, &format!("updated_kv_cache.{}.keys", index), &shape, data_type)
+            {
+                let size = shape.iter().product::<usize>() * data_type.size_in_bytes();
                 let keys = if let Some(layer) = kv.as_any().downcast_ref::<KVCacheLayer<B, B::SparseBuffer>>() {
                     common::helpers::sparse_buffer_read_allocation(ctx.context.as_ref(), &layer.keys, size)
+                } else if let Some(layer) = kv.as_any().downcast_ref::<KVCacheLayer<B, B::DenseBuffer>>() {
+                    let mut allocation = ctx
+                        .context
+                        .create_allocation(size, AllocationType::Global)
+                        .expect("Failed to create KV cache keys read allocation");
+                    let mut encoder =
+                        Encoder::<B>::new(ctx.context.as_ref()).expect("Failed to create KV cache keys read encoder");
+                    encoder.encode_copy(&layer.keys, 0..size, &mut allocation, 0..size);
+                    encoder.end_encoding().submit().wait_until_completed().expect("Failed to read KV cache keys");
+                    allocation
                 } else {
                     panic!("Wrong keys type")
                 };
@@ -328,16 +328,28 @@ impl<B: Backend> TraceValidator<B> {
                         data_type,
                         &expected,
                         &keys,
-                        &kv.shape(),
+                        &shape,
                         Some(ArrayTransform::KVCacheSlice),
                     ),
                 });
             }
 
-            if let Ok(expected) = traces_view.leaf_array(&format!("updated_kv_cache.{}.values", index)) {
-                let size = kv.shape().iter().product::<usize>() * data_type.size_in_bytes();
+            if let Ok(expected) =
+                Self::read_array(&traces_view, &format!("updated_kv_cache.{}.values", index), &shape, data_type)
+            {
+                let size = shape.iter().product::<usize>() * data_type.size_in_bytes();
                 let values = if let Some(layer) = kv.as_any().downcast_ref::<KVCacheLayer<B, B::SparseBuffer>>() {
                     common::helpers::sparse_buffer_read_allocation(ctx.context.as_ref(), &layer.values, size)
+                } else if let Some(layer) = kv.as_any().downcast_ref::<KVCacheLayer<B, B::DenseBuffer>>() {
+                    let mut allocation = ctx
+                        .context
+                        .create_allocation(size, AllocationType::Global)
+                        .expect("Failed to create KV cache values read allocation");
+                    let mut encoder =
+                        Encoder::<B>::new(ctx.context.as_ref()).expect("Failed to create KV cache values read encoder");
+                    encoder.encode_copy(&layer.values, 0..size, &mut allocation, 0..size);
+                    encoder.end_encoding().submit().wait_until_completed().expect("Failed to read KV cache values");
+                    allocation
                 } else {
                     panic!("Wrong values type")
                 };
@@ -347,7 +359,7 @@ impl<B: Backend> TraceValidator<B> {
                         data_type,
                         &expected,
                         &values,
-                        &kv.shape(),
+                        &shape,
                         Some(ArrayTransform::KVCacheSlice),
                     ),
                 });
@@ -364,7 +376,7 @@ impl<B: Backend> TraceValidator<B> {
                 format!("updated_state.{}.conv_state", index),
                 format!("activation_trace.layer_results.{}.updated_state.conv_state", index),
             ] {
-                if let Ok(expected) = traces_view.leaf_array(&path) {
+                if let Ok(expected) = Self::read_array(&traces_view, &path, &ssm.conv_shape, data_type) {
                     results.push(TracerValidationResult {
                         name: path,
                         metrics: Self::validate_optional_allocation(
@@ -382,7 +394,7 @@ impl<B: Backend> TraceValidator<B> {
                 format!("updated_state.{}.ssm_state", index),
                 format!("activation_trace.layer_results.{}.updated_state.ssm_state", index),
             ] {
-                if let Ok(expected) = traces_view.leaf_array(&path) {
+                if let Ok(expected) = Self::read_array(&traces_view, &path, &ssm.ssm_shape, data_type) {
                     results.push(TracerValidationResult {
                         name: path,
                         metrics: Self::validate_allocation(data_type, &expected, &ssm.ssm_state, &ssm.ssm_shape, None),
@@ -401,7 +413,7 @@ impl<B: Backend> TraceValidator<B> {
                 format!("updated_state.{}.conv_state", index),
                 format!("activation_trace.layer_results.{}.updated_state.conv_state", index),
             ] {
-                if let Ok(expected) = traces_view.leaf_array(&path) {
+                if let Ok(expected) = Self::read_array(&traces_view, &path, &delta.conv_shape, data_type) {
                     results.push(TracerValidationResult {
                         name: path,
                         metrics: Self::validate_allocation(
@@ -419,7 +431,7 @@ impl<B: Backend> TraceValidator<B> {
                 format!("updated_state.{}.ssm_state", index),
                 format!("activation_trace.layer_results.{}.updated_state.ssm_state", index),
             ] {
-                if let Ok(expected) = traces_view.leaf_array(&path) {
+                if let Ok(expected) = Self::read_array(&traces_view, &path, &delta.ssm_shape, data_type) {
                     results.push(TracerValidationResult {
                         name: path,
                         metrics: Self::validate_allocation(
@@ -435,24 +447,25 @@ impl<B: Backend> TraceValidator<B> {
         }
 
         // LLM-specific: Token comparison
-        let tokens_violation_indices = if let Ok(expected_logits) = traces_view.leaf_array("logits") {
-            let expected_tokens = Self::get_tokens_from_logits(&expected_logits);
-            let produced_tokens = Self::get_tokens_from_logits(&traces.logits);
-            expected_tokens
-                .iter()
-                .zip(produced_tokens.iter())
-                .enumerate()
-                .filter_map(|(i, (a, b))| {
-                    if a != b {
-                        Some(i)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let tokens_violation_indices =
+            if let Ok(expected_logits) = Self::read_array(&traces_view, "logits", traces.logits.shape(), data_type) {
+                let expected_tokens = Self::get_tokens_from_logits(&expected_logits);
+                let produced_tokens = Self::get_tokens_from_logits(&traces.logits);
+                expected_tokens
+                    .iter()
+                    .zip(produced_tokens.iter())
+                    .enumerate()
+                    .filter_map(|(i, (a, b))| {
+                        if a != b {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         Ok(TracerValidationResults {
             suffix_length: token_ids.len(),
@@ -470,27 +483,45 @@ impl<B: Backend> TraceValidator<B> {
         traces_path: &Path,
     ) -> Result<TracerValidationResults, Error> {
         let traces_file = File::open(traces_path).map_err(|_| Error::UnableToLoadWeights)?;
+        let (_header_len, traces_metadata) =
+            read_safetensors_metadata(&traces_file).map_err(|_| Error::UnableToLoadWeights)?;
         let context = classifier.context.context.clone();
         let traces_loader =
             ParameterLoader::new(&traces_file, context.as_ref()).map_err(|_| Error::UnableToLoadWeights)?;
         let traces_view = traces_loader.tree();
 
-        let has_token_ids = traces_view.leaf_array("activation_trace.token_ids").is_ok();
-        let has_token_positions = traces_view.leaf_array("activation_trace.token_positions").is_ok();
+        let has_token_ids = traces_view.leaf("activation_trace.token_ids").is_ok();
+        let has_token_positions = traces_view.leaf("activation_trace.token_positions").is_ok();
 
         if !has_token_ids || !has_token_positions {
-            return Ok(Self::handle_missing_tokens(&traces_view));
+            let logits_shape = traces_metadata
+                .tensors
+                .get("logits")
+                .or_else(|| traces_metadata.tensors.get("activation_trace.logits"))
+                .map(|tensor| tensor.shape.clone());
+            return Ok(Self::handle_missing_tokens(logits_shape));
         }
 
-        let token_ids = Self::load_array_as_vec::<i32, u64>(&traces_view, "activation_trace.token_ids");
-        let token_positions = Self::load_array_as_vec::<i32, usize>(&traces_view, "activation_trace.token_positions");
+        let token_shape = traces_metadata
+            .tensors
+            .get("activation_trace.token_ids")
+            .map(|tensor| tensor.shape.clone())
+            .ok_or(Error::UnableToLoadWeights)?;
+        let position_shape = traces_metadata
+            .tensors
+            .get("activation_trace.token_positions")
+            .map(|tensor| tensor.shape.clone())
+            .ok_or(Error::UnableToLoadWeights)?;
+        let token_ids = Self::load_array_as_vec::<i32, u64>(&traces_view, "activation_trace.token_ids", &token_shape);
+        let token_positions =
+            Self::load_array_as_vec::<i32, usize>(&traces_view, "activation_trace.token_positions", &position_shape);
 
         let suffix_length = token_ids.len();
 
         let (_logits, traces) =
             classifier.forward_pass_with_traces(&token_ids, &token_positions).map_err(|_| Error::GenerateFailed)?;
 
-        let data_type = classifier.context.model_shape.activation_data_type();
+        let data_type = classifier.context.forward_pass_config.embedding_forward_pass_config.activation_data_type;
 
         // Common layer validation
         let mut results = Self::validate_layer_traces(&traces, &traces_view, data_type);
@@ -506,9 +537,8 @@ impl<B: Backend> TraceValidator<B> {
         })
     }
 
-    fn handle_missing_tokens(traces_view: &ParameterTree<B::Context>) -> TracerValidationResults {
-        if let Ok(expected_logits) = traces_view.leaf_array("logits") {
-            let reference_shape = expected_logits.shape().to_vec();
+    fn handle_missing_tokens(logits_shape: Option<Vec<usize>>) -> TracerValidationResults {
+        if let Some(reference_shape) = logits_shape {
             let metrics = TracerValidationMetrics {
                 atol: 0.0,
                 rtol: 0.0,
@@ -558,7 +588,7 @@ impl<B: Backend> TraceValidator<B> {
         let mut results = Vec::new();
 
         let validate = |path: &str, array: &Array<B>| -> Option<TracerValidationResult> {
-            if let Ok(expected) = traces_view.leaf_array(path) {
+            if let Ok(expected) = Self::read_array(traces_view, path, array.shape(), data_type) {
                 Some(TracerValidationResult {
                     name: path.to_string(),
                     metrics: Self::validate_allocation(data_type, &expected, array.allocation(), array.shape(), None),
@@ -628,7 +658,9 @@ impl<B: Backend> TraceValidator<B> {
 
         // Output pooling (classifier-specific)
         if let Some(output_pooling) = &traces.output_pooling {
-            if let Ok(expected) = traces_view.leaf_array("activation_trace.output_pooling") {
+            if let Ok(expected) =
+                Self::read_array(traces_view, "activation_trace.output_pooling", output_pooling.shape(), data_type)
+            {
                 results.push(TracerValidationResult {
                     name: "activation_trace.output_pooling".to_string(),
                     metrics: Self::validate_allocation(
@@ -917,10 +949,22 @@ impl<B: Backend> TraceValidator<B> {
     fn load_array_as_vec<SourcePrecision: ArrayElement, TargetPrecision: NumCast>(
         traces_view: &ParameterTree<B::Context>,
         name: &str,
+        expected_shape: &[usize],
     ) -> Vec<TargetPrecision> {
-        let array = traces_view.leaf_array(name).unwrap();
-        let slice = array.as_slice::<SourcePrecision>();
+        let leaf = traces_view.leaf(name).unwrap().validate(expected_shape, SourcePrecision::data_type()).unwrap();
+        let slice = leaf.read_slice::<SourcePrecision>().unwrap();
         slice.iter().map(|x| NumCast::from(*x).unwrap()).collect()
+    }
+
+    fn read_array(
+        traces_view: &ParameterTree<B::Context>,
+        name: &str,
+        expected_shape: &[usize],
+        data_type: DataType,
+    ) -> Result<Array<B>, ParameterLoaderError<B>> {
+        let leaf = traces_view.leaf(name)?.validate(expected_shape, data_type)?;
+        let allocation = leaf.read_allocation()?;
+        Ok(unsafe { Array::from_allocation(allocation, 0, expected_shape, data_type) })
     }
 
     fn determine_prefill_step_size(model_path: &Path) -> usize {
@@ -955,12 +999,12 @@ impl<B: Backend> TraceValidator<B> {
         context.cache_layers = Rc::new(RefCell::new(CacheLayers::new(
             context.context.as_ref(),
             &context.model_shape,
+            context.forward_pass_config.embedding_forward_pass_config.activation_data_type,
             resolved_prefix_length,
             desired_suffix_length,
         )));
 
-        let intermediate_dtype: DataType =
-            context.model_config.model_config.transformer_config.output_norm_config.scale_precision.into();
+        let intermediate_dtype = context.forward_pass_config.embedding_forward_pass_config.activation_data_type;
 
         context.kv_cache_update = Box::new(
             KVCacheUpdate::new(context.context.as_ref(), intermediate_dtype, resolved_prefix_length)

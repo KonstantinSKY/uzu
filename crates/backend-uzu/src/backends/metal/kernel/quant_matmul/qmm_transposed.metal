@@ -183,7 +183,7 @@ PUBLIC KERNEL(QuantizedMatmulQmmTransposed)(
       for (uint row = row_start; row < row_end; row++) {
         uint output_index = row * out_vec_size + out_col;
 
-        output[output_index] = simdgroup_random_hadamard_transform(
+        output[output_index] = simdgroup_output_random_hadamard_transform(
             static_cast<ushort>(simd_lane),
             output[output_index],
             factor

@@ -1,10 +1,11 @@
 use std::{
+    fs::File,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use backend_uzu::{
-    VERSION,
+    VERSION, read_safetensors_metadata,
     session::{
         ChatSession,
         config::{DecodingConfig, RunConfig},
@@ -68,8 +69,20 @@ impl Runner {
 
         let mut session = ChatSession::new(PathBuf::from(self.model_path.clone()), decoding_config)?;
 
-        let precision =
-            session.model_metadata.model_config.model_config.transformer_config.output_norm_config.scale_precision;
+        let weights_path = PathBuf::from(self.model_path.clone()).join("model.safetensors");
+        let weights_file = File::open(&weights_path)?;
+        let (_header_len, metadata) = read_safetensors_metadata(&weights_file)?;
+        let precision = metadata
+            .tensors
+            .get("decoder.transformer.output_norm.scales")
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("missing decoder output norm scales in {}", weights_path.display()),
+                )
+            })?
+            .dtype
+            .into();
 
         let device = self.get_device_info();
 

@@ -15,7 +15,9 @@ use tokenizers::Tokenizer;
 
 use crate::{
     backends::{common::Backend, select_backend},
-    config::{LanguageModelConfig, MixerConfig, ModelMetadata},
+    config::{
+        model::language_model::LanguageModelConfig, token_codec::AnyTokenCodecConfig, token_mixer::AnyTokenMixerConfig,
+    },
     language_model::{
         LanguageModelGenerator, LanguageModelGeneratorTrait,
         grammar::{CompiledGrammar, create_compiled_grammar},
@@ -47,7 +49,7 @@ struct RunContext {
 
 pub struct ChatSession {
     pub model_path: PathBuf,
-    pub model_metadata: ModelMetadata<LanguageModelConfig>,
+    pub model_config: LanguageModelConfig,
 
     tokenizer: Tokenizer,
     stop_token_ids: Vec<i32>,
@@ -83,16 +85,17 @@ impl ChatSession {
             return Err(Error::UnableToLoadConfig);
         }
         let config_file = File::open(&config_path).map_err(|_| Error::UnableToLoadConfig)?;
-        let model_metadata: ModelMetadata<LanguageModelConfig> = serde_json::from_reader(BufReader::new(config_file))
-            .map_err(|err| {
-            eprintln!("Failed to parse config.json: {err}");
-            Error::UnableToLoadConfig
-        })?;
+        let model_config: LanguageModelConfig =
+            serde_json::from_reader(BufReader::new(config_file)).map_err(|err| {
+                eprintln!("Failed to parse config.json: {err}");
+                Error::UnableToLoadConfig
+            })?;
 
-        let layers = &model_metadata.model_config.model_config.transformer_config.layer_configs;
+        let layers = &model_config.decoder_config.transformer_config.layer_configs;
         let has_non_attention_mixer =
-            layers.iter().any(|layer| !matches!(layer.mixer_config, MixerConfig::Attention(_)));
-        let has_mamba_mixer = layers.iter().any(|layer| matches!(layer.mixer_config, MixerConfig::Mamba(_)));
+            layers.iter().any(|layer| !matches!(layer.mixer_config, AnyTokenMixerConfig::AttentionConfig(_)));
+        let has_mamba_mixer =
+            layers.iter().any(|layer| matches!(layer.mixer_config, AnyTokenMixerConfig::Mamba2Config(_)));
         if has_non_attention_mixer {
             match decoding_config.context_mode {
                 ContextMode::None => {},
@@ -117,22 +120,25 @@ impl ChatSession {
         }
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|_| Error::UnableToLoadTokenizer)?;
 
+        let AnyTokenCodecConfig::ChatCodecConfig(token_codec_config) = &model_config.token_codec_config else {
+            return Err(Error::UnableToLoadConfig);
+        };
+
         let stop_token_ids: Vec<i32> =
-            model_metadata.model_config.generation_config.stop_token_ids.iter().map(|&x| x as i32).collect();
+            model_config.generation_config.stop_token_ids.iter().map(|&x| x as i32).collect();
 
-        let input_processor = InputProcessorDefault::new(model_metadata.model_config.message_processor_config.clone());
+        let input_processor = InputProcessorDefault::new(token_codec_config.clone());
 
-        let output_parser =
-            OutputParser::new(model_metadata.model_config.message_processor_config.output_parser_regex.clone())?;
+        let output_parser = OutputParser::new(token_codec_config.output_parser_regex.clone())?;
 
         let llm = Box::new(
-            LanguageModelGenerator::<B>::new(&model_path, decoding_config.clone(), &model_metadata)
+            LanguageModelGenerator::<B>::new(&model_path, decoding_config.clone(), &model_config)
                 .map_err(Error::from)?,
         );
 
         Ok(Self {
             model_path,
-            model_metadata,
+            model_config,
             tokenizer,
             stop_token_ids,
             input_processor: Box::new(input_processor),
@@ -231,7 +237,7 @@ impl ChatSession {
             .collect();
 
         let language_model_generator = self.llm.as_mut().ok_or(Error::LanguageModelGeneratorNotLoaded)?;
-        let context_length = self.decoding_config.context_length.resolve(&self.model_metadata.model_config);
+        let context_length = self.decoding_config.context_length.resolve(&self.model_config);
         if tokens.len() >= context_length {
             return Err(Error::ContextLengthExceeded);
         }
@@ -239,10 +245,9 @@ impl ChatSession {
         let prefix_offset = language_model_generator.tokens_len();
         let prefix_len_before = prefix_offset;
 
-        let eos_tokens: Vec<u64> =
-            self.model_metadata.model_config.generation_config.stop_token_ids.iter().map(|&x| x as u64).collect();
+        let eos_tokens: Vec<u64> = self.model_config.generation_config.stop_token_ids.iter().copied().collect();
 
-        let sampling_method = config.sampling_policy.resolve(&self.model_metadata.model_config);
+        let sampling_method = config.sampling_policy.resolve(&self.model_config);
 
         let mut compiled_grammar: Option<Box<dyn CompiledGrammar>> = if let Some(ref config) = config.grammar_config {
             Some(create_compiled_grammar(config, &self.tokenizer, Some(&self.stop_token_ids))?)
@@ -262,7 +267,7 @@ impl ChatSession {
         let prefill_tokens = prefill_result.tokens.clone();
         let prefill_duration = prefill_start.elapsed().as_secs_f64();
 
-        let prefill_suffix_length = self.decoding_config.prefill_step_size.resolve(&self.model_metadata.model_config);
+        let prefill_suffix_length = self.decoding_config.prefill_step_size.resolve(&self.model_config);
 
         let run_context = RunContext {
             eos_tokens,

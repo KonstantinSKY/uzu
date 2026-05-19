@@ -3,7 +3,10 @@ use crate::{
     array::{Array, ArrayContextExt},
     backends::common::{Allocation, AsBufferRangeRef},
     encodable_block::LayerArguments,
-    forward_pass::token_inputs::TokenInputs,
+    forward_pass::{
+        config::{embedding::EmbeddingForwardPassConfig, transformer::TransformerForwardPassConfig},
+        token_inputs::TokenInputs,
+    },
 };
 
 impl StructuredAudioCodecGraph {
@@ -88,19 +91,15 @@ impl StructuredAudioCodecGraph {
         required_sequence_length: usize,
     ) -> AudioResult<StructuredAudioPostModuleRuntime<B>> {
         let decoder_config = Rc::new(DecoderConfig {
-            embedding_config: EmbeddingConfig::Untied {
-                common: EmbeddingConfigCommon {
-                    input_scale: None,
-                    logit_soft_cap: None,
-                },
-                precision: self.vocoder_data_type.into(),
-            },
+            embedding_config: AnyEmbeddingConfig::UntiedEmbeddingConfig(UntiedEmbeddingConfig::new(None, None)),
             transformer_config: self.config.quantizer_config.post_module_config.clone(),
             vocab_size: 1,
             pard_token: None,
             ple_model_config: None,
         });
         let model_shape = ModelShape::from_decoder_config(&decoder_config);
+        let transformer_forward_pass_config = TransformerForwardPassConfig::new_for_inference();
+        let activation_data_type = EmbeddingForwardPassConfig::new_for_inference().activation_data_type;
 
         let weights_file = File::open(self.weights_path.as_str()).map_err(|err| {
             AudioError::Runtime(format!("failed to open post_module weights '{}': {err}", self.weights_path))
@@ -115,7 +114,8 @@ impl StructuredAudioCodecGraph {
             .map_err(|err| AudioError::Runtime(format!("missing structured audio post_module subtree: {err}")))?;
 
         let max_sequence_length = decoder_config.transformer_config.context_length.max(required_sequence_length.max(1));
-        let mut shared_buffers = SharedBuffers::new(context.as_ref(), &decoder_config);
+        let mut shared_buffers =
+            SharedBuffers::new(context.as_ref(), &decoder_config, &transformer_forward_pass_config);
         {
             let transformer_tree = root_loader_view
                 .subtree(transformer_subtree_name)
@@ -130,11 +130,16 @@ impl StructuredAudioCodecGraph {
             &decoder_config,
             &root_loader_view,
             transformer_subtree_name,
+            None,
+            &model_shape,
+            &transformer_forward_pass_config,
+            activation_data_type,
         );
 
         Ok(StructuredAudioPostModuleRuntime {
             context,
             model_shape,
+            activation_data_type,
             shared_buffers,
             layers,
             output_norm,
@@ -180,23 +185,46 @@ impl StructuredAudioCodecGraph {
         let audio_decoder_tree = root.subtree("audio_decoder")?;
         let quantizer_tree = audio_decoder_tree.subtree("quantizer")?;
         let semantic_tree = quantizer_tree.subtree("semantic_quantizer")?.subtree("quantizers")?.subtree("0")?;
-        let semantic_codebook = read_float_matrix_exact::<B>(
-            &semantic_tree.subtree("codebook")?,
-            "weights",
-            self.semantic_codebook_size,
-            self.config.codebook_dim,
-            data_type,
-        )?;
         let codebook_dim = self.config.codebook_dim;
-        let semantic_out_proj = read_float_matrix_exact::<B>(
-            &semantic_tree.subtree("out_proj")?,
-            "weights",
-            self.input_dim,
-            codebook_dim,
-            data_type,
-        )?;
-        let semantic_out_bias =
-            read_float_vector_exact::<B>(&semantic_tree.subtree("out_proj")?, "biases", self.input_dim, data_type)?;
+        let semantic_codebook_shape = [self.semantic_codebook_size, codebook_dim];
+        let semantic_codebook = unsafe {
+            Array::from_allocation(
+                semantic_tree
+                    .subtree("codebook")?
+                    .leaf("weights")?
+                    .validate(&semantic_codebook_shape, data_type)?
+                    .read_allocation()?,
+                0,
+                &semantic_codebook_shape,
+                data_type,
+            )
+        };
+        let semantic_out_proj_shape = [self.input_dim, codebook_dim];
+        let semantic_out_proj = unsafe {
+            Array::from_allocation(
+                semantic_tree
+                    .subtree("out_proj")?
+                    .leaf("weights")?
+                    .validate(&semantic_out_proj_shape, data_type)?
+                    .read_allocation()?,
+                0,
+                &semantic_out_proj_shape,
+                data_type,
+            )
+        };
+        let semantic_out_bias_shape = [self.input_dim];
+        let semantic_out_bias = unsafe {
+            Array::from_allocation(
+                semantic_tree
+                    .subtree("out_proj")?
+                    .leaf("biases")?
+                    .validate(&semantic_out_bias_shape, data_type)?
+                    .read_allocation()?,
+                0,
+                &semantic_out_bias_shape,
+                data_type,
+            )
+        };
 
         let residual_quantizers = self.config.n_codebooks;
         let residual_count_for_shape = residual_quantizers.max(1);
@@ -210,26 +238,45 @@ impl StructuredAudioCodecGraph {
         let residual_root = quantizer_tree.subtree("quantizer")?.subtree("quantizers")?;
         for index in 0..residual_quantizers {
             let quantizer_tree = residual_root.subtree(&index.to_string())?;
-            let codebook = read_float_matrix_exact::<B>(
-                &quantizer_tree.subtree("codebook")?,
-                "weights",
-                self.codebook_size,
-                codebook_dim,
-                data_type,
-            )?;
-            let out_proj = read_float_matrix_exact::<B>(
-                &quantizer_tree.subtree("out_proj")?,
-                "weights",
-                self.input_dim,
-                codebook_dim,
-                data_type,
-            )?;
-            let out_bias = read_float_vector_exact::<B>(
-                &quantizer_tree.subtree("out_proj")?,
-                "biases",
-                self.input_dim,
-                data_type,
-            )?;
+            let codebook_shape = [self.codebook_size, codebook_dim];
+            let codebook = unsafe {
+                Array::from_allocation(
+                    quantizer_tree
+                        .subtree("codebook")?
+                        .leaf("weights")?
+                        .validate(&codebook_shape, data_type)?
+                        .read_allocation()?,
+                    0,
+                    &codebook_shape,
+                    data_type,
+                )
+            };
+            let out_proj_shape = [self.input_dim, codebook_dim];
+            let out_proj = unsafe {
+                Array::from_allocation(
+                    quantizer_tree
+                        .subtree("out_proj")?
+                        .leaf("weights")?
+                        .validate(&out_proj_shape, data_type)?
+                        .read_allocation()?,
+                    0,
+                    &out_proj_shape,
+                    data_type,
+                )
+            };
+            let out_bias_shape = [self.input_dim];
+            let out_bias = unsafe {
+                Array::from_allocation(
+                    quantizer_tree
+                        .subtree("out_proj")?
+                        .leaf("biases")?
+                        .validate(&out_bias_shape, data_type)?
+                        .read_allocation()?,
+                    0,
+                    &out_bias_shape,
+                    data_type,
+                )
+            };
 
             copy_to_outer_axis_slice(&mut residual_codebooks, index, &codebook, &[self.codebook_size, codebook_dim])?;
             copy_to_outer_axis_slice(&mut residual_out_proj, index, &out_proj, &[self.input_dim, codebook_dim])?;
@@ -431,11 +478,10 @@ impl StructuredAudioCodecGraph {
                     self.input_dim, main_shape[0], main_shape[1]
                 )));
             }
-            if runtime.model_shape.activation_data_type() != self.vocoder_data_type {
+            if runtime.activation_data_type != self.vocoder_data_type {
                 return Err(AudioError::Runtime(format!(
                     "post_module dtype mismatch: main={:?}, latent={:?}",
-                    runtime.model_shape.activation_data_type(),
-                    self.vocoder_data_type
+                    runtime.activation_data_type, self.vocoder_data_type
                 )));
             }
 

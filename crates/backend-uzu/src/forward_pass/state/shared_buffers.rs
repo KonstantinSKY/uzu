@@ -1,11 +1,10 @@
-use half::{bf16, f16};
-
 use super::RopeBuffers;
 use crate::{
     DataType,
     array::ArrayContextExt,
     backends::common::{Allocation, AsBufferRangeMut, Backend, DenseBuffer},
-    config::{DecoderConfig, RoPEConfig},
+    config::{decoder::DecoderConfig, rope::AnyRoPEConfig},
+    forward_pass::config::transformer::TransformerForwardPassConfig,
     parameters::ParameterTree,
     session::types::Error,
 };
@@ -26,33 +25,44 @@ impl<B: Backend> SharedBuffers<B> {
     pub fn new(
         context: &B::Context,
         decoder_config: &DecoderConfig,
+        forward_pass_config: &TransformerForwardPassConfig,
     ) -> Self {
         let tf = &decoder_config.transformer_config;
 
-        let mut configs = Vec::<RoPEConfig>::new();
+        let mut configs = Vec::<(AnyRoPEConfig, usize)>::new();
         let layer_rope_kinds: Box<[LayerRopeKind]> = tf
             .layer_configs
             .iter()
             .map(|layer_config| {
-                if layer_config.mixer_config.as_attention().is_none() {
+                let Some(attention_config) = layer_config.mixer_config.as_attention() else {
                     return LayerRopeKind::NoKernel;
-                }
+                };
                 let Some(rope_config) = &layer_config.rope_config else {
                     return LayerRopeKind::NoKernel;
                 };
-                let index = configs.iter().position(|existing| existing == rope_config).unwrap_or_else(|| {
-                    configs.push(rope_config.clone());
-                    configs.len() - 1
-                });
+                let head_dim = rope_config.head_dim().unwrap_or(attention_config.head_dim);
+                let index = configs
+                    .iter()
+                    .position(|(existing_config, existing_head_dim)| {
+                        existing_config == rope_config && *existing_head_dim == head_dim
+                    })
+                    .unwrap_or_else(|| {
+                        configs.push((rope_config.clone(), head_dim));
+                        configs.len() - 1
+                    });
                 LayerRopeKind::Indexed(index)
             })
             .collect();
 
         let rope_buffers: Box<[RopeBuffers<B>]> = configs
             .iter()
-            .map(|config| {
-                let common = config.common();
-                RopeBuffers::new(context, common.max_sequence_length, common.head_dim, common.precision.into())
+            .map(|(config, head_dim)| {
+                RopeBuffers::new(
+                    context,
+                    *config.max_sequence_length(),
+                    *head_dim,
+                    forward_pass_config.mixer_forward_pass_config.rope_data_type,
+                )
             })
             .collect();
 
@@ -95,7 +105,6 @@ impl<B: Backend> SharedBuffers<B> {
             };
             let layer_tree = transformer_tree.subtree(&format!("layers.{}", layer_idx)).unwrap();
             let attn_tree = layer_tree.subtree("mixer").unwrap();
-            let sinks_arr = attn_tree.leaf_array("sinks").unwrap();
             let dst_slice = unsafe {
                 let buffer_range = sink_cell.as_buffer_range_mut();
                 let range = buffer_range.range();
@@ -105,27 +114,10 @@ impl<B: Backend> SharedBuffers<B> {
                 )
             };
 
-            match sinks_arr.data_type() {
-                DataType::F32 => {
-                    let src = sinks_arr.as_slice::<f32>();
-                    dst_slice.copy_from_slice(src);
-                },
-                DataType::BF16 => {
-                    let src = sinks_arr.as_slice::<bf16>();
-                    for (dst_val, src_val) in dst_slice.iter_mut().zip(src.iter()) {
-                        *dst_val = f32::from(*src_val);
-                    }
-                },
-                DataType::F16 => {
-                    let src = sinks_arr.as_slice::<f16>();
-                    for (dst_val, src_val) in dst_slice.iter_mut().zip(src.iter()) {
-                        *dst_val = f32::from(*src_val);
-                    }
-                },
-                other => {
-                    panic!("Unsupported attention sink data type: {:?}", other);
-                },
-            }
+            let sinks_leaf = attn_tree.leaf("sinks").unwrap();
+            let sinks_leaf = sinks_leaf.validate(&[dst_slice.len()], DataType::F32).unwrap();
+            let src = sinks_leaf.read_slice::<f32>().unwrap();
+            dst_slice.copy_from_slice(&src);
         }
         Ok(())
     }

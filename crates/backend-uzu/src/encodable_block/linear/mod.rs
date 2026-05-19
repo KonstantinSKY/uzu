@@ -10,8 +10,16 @@ pub use rht_wrapper::{RHTLinearWrapper, RHTLinearWrapperError};
 use thiserror::Error;
 
 use crate::{
-    backends::common::{Allocation, Backend, Encoder},
-    config::LinearConfig,
+    DataType,
+    backends::common::{Allocation, Backend, Encoder, gpu_types::QuantizationMethod},
+    config::weight_matrix::{
+        AnyWeightMatrixSpec, Layout,
+        awq_spec::AWQSpec,
+        full_precision_spec::FullPrecisionSpec,
+        hybrid_spec::{HybridSpec, IncoherenceProcessingMode},
+        low_rank_spec::LowRankSpec,
+        mlx_spec::MLXSpec,
+    },
     parameters::{ParameterLoaderError, ParameterTree},
 };
 
@@ -36,132 +44,316 @@ pub enum LinearBlockError<B: Backend> {
     RHTLinearWrapperError(#[from] RHTLinearWrapperError<B>),
     #[error("Parameter loading error: {0}")]
     ParameterError(#[from] ParameterLoaderError<B>),
+    #[error("Unsupported linear configuration: {0}")]
+    UnsupportedConfiguration(String),
 }
 
 impl<B: Backend> dyn Linear<B> {
     pub fn new<const N: usize>(
-        config: &LinearConfig,
         input_dimension: usize,
         output_dimensions: [usize; N],
         context: &B::Context,
+        data_type: DataType,
         parameter_tree: &ParameterTree<B::Context>,
     ) -> Result<Box<dyn Linear<B>>, LinearBlockError<B>> {
         let output_dimension_sum: usize = output_dimensions.iter().sum();
-        match config {
-            LinearConfig::Quantized(quantization_config) | LinearConfig::ScaleBiasQuantized(quantization_config) => {
-                let block = QuantizedLinear::new(
-                    context,
-                    quantization_config,
-                    input_dimension,
-                    output_dimension_sum,
-                    parameter_tree,
-                    None,
-                )?;
-                Ok(Box::new(block))
-            },
-            LinearConfig::FullPrecision {
-                precision,
-            } => {
+        let weights_tree = parameter_tree.subtree("weights")?;
+        let spec = weights_tree.metadata::<AnyWeightMatrixSpec>("spec")?;
+        match spec {
+            AnyWeightMatrixSpec::FullPrecisionSpec(FullPrecisionSpec {
+                layout: Layout::OutputInput,
+                ..
+            }) => {
                 let block = FullPrecisionLinear::new(
                     context,
-                    (*precision).into(),
                     input_dimension,
                     output_dimension_sum,
+                    data_type,
                     parameter_tree,
                 )?;
                 Ok(Box::new(block))
             },
-            LinearConfig::QLoRA {
-                quantization,
-                lora_rank,
-                lora_scale,
-            } => {
-                let block = QLoRALinearWrapper::new(
+            AnyWeightMatrixSpec::MLXSpec(MLXSpec {
+                bits,
+                group_size,
+                layout: Layout::OutputInput,
+                ..
+            }) => {
+                let block = QuantizedLinear::new(
                     context,
-                    quantization,
-                    *lora_rank,
-                    *lora_scale,
+                    bits,
+                    group_size,
+                    QuantizationMethod::ScaleBias,
                     input_dimension,
                     output_dimension_sum,
-                    parameter_tree,
+                    data_type,
+                    &weights_tree,
+                    Some(parameter_tree),
                     None,
                 )?;
                 Ok(Box::new(block))
             },
-            LinearConfig::RHTLinearWrapper {
-                block_size,
-                inner_config,
-            } => Ok(Box::new(RHTLinearWrapper::new(
+            AnyWeightMatrixSpec::AWQSpec(AWQSpec {
+                bits,
+                group_size,
+                is_symmetric: false,
+                layout: Layout::OutputInput,
+                ..
+            }) => {
+                let block = QuantizedLinear::new(
+                    context,
+                    bits,
+                    group_size,
+                    QuantizationMethod::ScaleZeroPoint,
+                    input_dimension,
+                    output_dimension_sum,
+                    data_type,
+                    &weights_tree,
+                    Some(parameter_tree),
+                    None,
+                )?;
+                Ok(Box::new(block))
+            },
+            AnyWeightMatrixSpec::HybridSpec(HybridSpec {
+                adapter_spec: None,
+                incoherence_block_size: Some(32),
+                incoherence_processing_mode: IncoherenceProcessingMode::InputOutput,
+                ..
+            }) => Ok(Box::new(RHTLinearWrapper::new(
                 context,
-                *block_size,
-                inner_config,
                 input_dimension,
                 output_dimension_sum,
+                data_type,
                 parameter_tree,
             )?)),
+            AnyWeightMatrixSpec::HybridSpec(HybridSpec {
+                quantization_spec,
+                adapter_spec: Some(adapter_spec),
+                incoherence_block_size: None,
+                ..
+            }) => {
+                let quantized_tree = weights_tree.subtree("quantized")?;
+                let adapter_tree = weights_tree.subtree("adapter")?;
+                match (*quantization_spec, *adapter_spec) {
+                    (
+                        AnyWeightMatrixSpec::MLXSpec(MLXSpec {
+                            bits,
+                            group_size,
+                            layout: Layout::OutputInput,
+                            ..
+                        }),
+                        AnyWeightMatrixSpec::LowRankSpec(LowRankSpec {
+                            rank,
+                            ..
+                        }),
+                    ) => Ok(Box::new(QLoRALinearWrapper::new(
+                        context,
+                        bits,
+                        group_size,
+                        QuantizationMethod::ScaleBias,
+                        rank,
+                        input_dimension,
+                        output_dimension_sum,
+                        data_type,
+                        &quantized_tree,
+                        &adapter_tree,
+                        Some(parameter_tree),
+                        None,
+                    )?)),
+                    (
+                        AnyWeightMatrixSpec::AWQSpec(AWQSpec {
+                            bits,
+                            group_size,
+                            is_symmetric: false,
+                            layout: Layout::OutputInput,
+                            ..
+                        }),
+                        AnyWeightMatrixSpec::LowRankSpec(LowRankSpec {
+                            rank,
+                            ..
+                        }),
+                    ) => Ok(Box::new(QLoRALinearWrapper::new(
+                        context,
+                        bits,
+                        group_size,
+                        QuantizationMethod::ScaleZeroPoint,
+                        rank,
+                        input_dimension,
+                        output_dimension_sum,
+                        data_type,
+                        &quantized_tree,
+                        &adapter_tree,
+                        Some(parameter_tree),
+                        None,
+                    )?)),
+                    (quantization_spec, adapter_spec) => Err(LinearBlockError::UnsupportedConfiguration(format!(
+                        "Hybrid quantization={quantization_spec:?}, adapter={adapter_spec:?}"
+                    ))),
+                }
+            },
+            AnyWeightMatrixSpec::HybridSpec(HybridSpec {
+                quantization_spec,
+                adapter_spec: Some(adapter_spec),
+                incoherence_block_size: Some(32),
+                incoherence_processing_mode: IncoherenceProcessingMode::InputOutput,
+                ..
+            }) => {
+                let quantized_tree = weights_tree.subtree("quantized")?;
+                let adapter_tree = weights_tree.subtree("adapter")?;
+                let incoherence_signs_tree = weights_tree.subtree("incoherence_signs")?;
+                match (*quantization_spec, *adapter_spec) {
+                    (
+                        AnyWeightMatrixSpec::MLXSpec(MLXSpec {
+                            bits,
+                            group_size,
+                            layout: Layout::OutputInput,
+                            ..
+                        }),
+                        AnyWeightMatrixSpec::LowRankSpec(LowRankSpec {
+                            rank,
+                            ..
+                        }),
+                    ) => Ok(Box::new(QLoRALinearWrapper::new(
+                        context,
+                        bits,
+                        group_size,
+                        QuantizationMethod::ScaleBias,
+                        rank,
+                        input_dimension,
+                        output_dimension_sum,
+                        data_type,
+                        &quantized_tree,
+                        &adapter_tree,
+                        Some(parameter_tree),
+                        Some(&incoherence_signs_tree),
+                    )?)),
+                    (
+                        AnyWeightMatrixSpec::AWQSpec(AWQSpec {
+                            bits,
+                            group_size,
+                            is_symmetric: false,
+                            layout: Layout::OutputInput,
+                            ..
+                        }),
+                        AnyWeightMatrixSpec::LowRankSpec(LowRankSpec {
+                            rank,
+                            ..
+                        }),
+                    ) => Ok(Box::new(QLoRALinearWrapper::new(
+                        context,
+                        bits,
+                        group_size,
+                        QuantizationMethod::ScaleZeroPoint,
+                        rank,
+                        input_dimension,
+                        output_dimension_sum,
+                        data_type,
+                        &quantized_tree,
+                        &adapter_tree,
+                        Some(parameter_tree),
+                        Some(&incoherence_signs_tree),
+                    )?)),
+                    (quantization_spec, adapter_spec) => Err(LinearBlockError::UnsupportedConfiguration(format!(
+                        "Hybrid quantization={quantization_spec:?}, adapter={adapter_spec:?}"
+                    ))),
+                }
+            },
+            spec => Err(LinearBlockError::UnsupportedConfiguration(format!("{spec:?}"))),
         }
     }
 
     pub fn new_with_output_hadamard(
         context: &B::Context,
-        config: &LinearConfig,
-        parameter_tree: &ParameterTree<B::Context>,
+        weights_tree: &ParameterTree<B::Context>,
+        bias_tree: Option<&ParameterTree<B::Context>>,
         output_factors: Allocation<B>,
         input_dim: usize,
         output_dim: usize,
+        data_type: DataType,
     ) -> Result<Box<dyn Linear<B>>, LinearBlockError<B>> {
-        match config {
-            LinearConfig::Quantized(config) | LinearConfig::ScaleBiasQuantized(config) => Ok(Box::new(
-                QuantizedLinear::new(context, config, input_dim, output_dim, parameter_tree, Some(output_factors))?,
-            )),
-            LinearConfig::QLoRA {
-                quantization,
-                lora_rank,
-                lora_scale,
-            } => Ok(Box::new(QLoRALinearWrapper::new(
+        let spec = weights_tree.metadata::<AnyWeightMatrixSpec>("spec")?;
+        match spec {
+            AnyWeightMatrixSpec::MLXSpec(MLXSpec {
+                bits,
+                group_size,
+                layout: Layout::OutputInput,
+                ..
+            }) => Ok(Box::new(QuantizedLinear::new(
                 context,
-                quantization,
-                *lora_rank,
-                *lora_scale,
+                bits,
+                group_size,
+                QuantizationMethod::ScaleBias,
                 input_dim,
                 output_dim,
-                parameter_tree,
+                data_type,
+                weights_tree,
+                bias_tree,
                 Some(output_factors),
             )?)),
-            inner_config => unimplemented!("{inner_config:?} doesn't support fused output hadamard"),
+            AnyWeightMatrixSpec::AWQSpec(AWQSpec {
+                bits,
+                group_size,
+                is_symmetric: false,
+                layout: Layout::OutputInput,
+                ..
+            }) => Ok(Box::new(QuantizedLinear::new(
+                context,
+                bits,
+                group_size,
+                QuantizationMethod::ScaleZeroPoint,
+                input_dim,
+                output_dim,
+                data_type,
+                weights_tree,
+                bias_tree,
+                Some(output_factors),
+            )?)),
+            spec => Err(LinearBlockError::UnsupportedConfiguration(format!(
+                "{spec:?} doesn't support fused output hadamard"
+            ))),
         }
     }
 
     pub fn new_extracting_input_hadamard<const N: usize>(
-        config: &LinearConfig,
         input_dimension: usize,
         output_dimensions: [usize; N],
         context: &B::Context,
+        data_type: DataType,
         parameter_tree: &ParameterTree<B::Context>,
     ) -> Result<(Box<dyn Linear<B>>, Option<Allocation<B>>), LinearBlockError<B>> {
         let output_dimension_sum: usize = output_dimensions.iter().sum();
-        match config {
-            LinearConfig::RHTLinearWrapper {
-                inner_config,
-                ..
-            } => {
-                let input_factors = parameter_tree.leaf("input_factors")?.read_allocation()?;
-                let output_factors = parameter_tree.leaf("output_factors")?.read_allocation()?;
-                let inner_tree = parameter_tree.subtree("inner_linear")?;
-                let inner_linear = Self::new_with_output_hadamard(
-                    context,
-                    inner_config,
-                    &inner_tree,
-                    output_factors,
-                    input_dimension,
-                    output_dimension_sum,
-                )?;
-                Ok((inner_linear, Some(input_factors)))
-            },
-            other => {
-                let linear = Self::new(other, input_dimension, output_dimensions, context, parameter_tree)?;
-                Ok((linear, None))
-            },
+        let weights_tree = parameter_tree.subtree("weights")?;
+        let spec = weights_tree.metadata::<AnyWeightMatrixSpec>("spec")?;
+        if let AnyWeightMatrixSpec::HybridSpec(HybridSpec {
+            adapter_spec: None,
+            incoherence_block_size: Some(32),
+            incoherence_processing_mode: IncoherenceProcessingMode::InputOutput,
+            ..
+        }) = spec
+        {
+            let incoherence_signs_tree = weights_tree.subtree("incoherence_signs")?;
+            let input_factors = incoherence_signs_tree
+                .leaf("input_signs")?
+                .validate(&[input_dimension], DataType::I32)?
+                .read_allocation()?;
+            let output_factors = incoherence_signs_tree
+                .leaf("output_signs")?
+                .validate(&[output_dimension_sum], DataType::I32)?
+                .read_allocation()?;
+            let quantized_tree = weights_tree.subtree("quantized")?;
+            let inner_linear = Self::new_with_output_hadamard(
+                context,
+                &quantized_tree,
+                Some(parameter_tree),
+                output_factors,
+                input_dimension,
+                output_dimension_sum,
+                data_type,
+            )?;
+            Ok((inner_linear, Some(input_factors)))
+        } else {
+            let linear = Self::new(input_dimension, output_dimensions, context, data_type, parameter_tree)?;
+            Ok((linear, None))
         }
     }
 }

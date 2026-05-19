@@ -1,16 +1,14 @@
 use std::{fs::File, path::Path, rc::Rc};
 
-#[cfg(feature = "tracing")]
-use crate::forward_pass::model_shape::ModelShape;
 use crate::{
     DataType,
     backends::common::{Backend, Context},
     classifier::ClassifierError,
-    config::{ClassifierModelConfig, ModelMetadata},
+    config::{decoder::DecoderConfig, model::classifier_model::ClassifierModelConfig},
     encodable_block::{
         ClassifierLayer, ClassifierPredictionHead, Embedding, Linear, Normalization, Pooling, QkUnpack, Rope,
     },
-    forward_pass::state::SharedBuffers,
+    forward_pass::{config::classifier::ClassifierForwardPassConfig, model_shape::ModelShape, state::SharedBuffers},
     parameters::ParameterLoader,
     session::types::Error,
 };
@@ -22,6 +20,8 @@ pub struct ClassifierContext<B: Backend> {
 
     pub model_config: ClassifierModelConfig,
     #[cfg(feature = "tracing")]
+    pub forward_pass_config: ClassifierForwardPassConfig,
+    #[cfg(feature = "tracing")]
     pub model_shape: ModelShape,
 
     pub embed: Embedding<B>,
@@ -31,24 +31,24 @@ pub struct ClassifierContext<B: Backend> {
 
     pub pooling: Pooling<B>,
     pub prediction_head: ClassifierPredictionHead<B>,
+    pub logits_data_type: DataType,
 }
 
 impl<B: Backend> ClassifierContext<B> {
     pub fn new(
         model_path: &Path,
-        model_metadata: &ModelMetadata<ClassifierModelConfig>,
+        model_config: &ClassifierModelConfig,
     ) -> Result<Self, Error> {
         let context = B::Context::new().map_err(|e| Error::UnableToCreateContext(e.into()))?;
+        let classifier_config = &model_config.classifier_config;
 
-        let decoder_config = Rc::new(crate::config::DecoderConfig {
-            embedding_config: model_metadata.model_config.model_config.embedding_config.clone(),
-            transformer_config: model_metadata.model_config.model_config.transformer_config.clone(),
-            vocab_size: model_metadata.model_config.model_config.vocab_size,
+        let decoder_config = Rc::new(DecoderConfig {
+            embedding_config: classifier_config.embedding_config.clone(),
+            transformer_config: classifier_config.transformer_config.clone(),
+            vocab_size: classifier_config.vocab_size,
             pard_token: None,
             ple_model_config: None,
         });
-        #[cfg(feature = "tracing")]
-        let model_shape = ModelShape::from_decoder_config(&decoder_config);
 
         let weights_path = model_path.join("model.safetensors");
         if !weights_path.exists() {
@@ -56,9 +56,20 @@ impl<B: Backend> ClassifierContext<B> {
         }
         let weights_file = File::open(&weights_path).map_err(|_| Error::UnableToLoadWeights)?;
         let loader = ParameterLoader::new(&weights_file, context.as_ref()).map_err(|_| Error::UnableToLoadWeights)?;
-        let root_loader_view = loader.tree();
+        let root_loader_view = loader
+            .tree()
+            .subtree("classifier")
+            .map_err(|_| Error::Classifier(ClassifierError::WeightSubtreeNotFound("classifier".to_string())))?;
 
-        let mut shared_buffers = SharedBuffers::new(context.as_ref(), &decoder_config);
+        let model_shape = ModelShape::from_decoder_config(&decoder_config);
+        let forward_pass_config = ClassifierForwardPassConfig::new_for_inference();
+        let activation_data_type = forward_pass_config.embedding_forward_pass_config.activation_data_type;
+
+        let mut shared_buffers = SharedBuffers::new(
+            context.as_ref(),
+            &decoder_config,
+            &forward_pass_config.transformer_forward_pass_config,
+        );
         shared_buffers.update_data(&root_loader_view)?;
         let shared_buffers = Rc::new(shared_buffers);
 
@@ -66,12 +77,9 @@ impl<B: Backend> ClassifierContext<B> {
             .subtree("transformer")
             .map_err(|_| Error::Classifier(ClassifierError::WeightSubtreeNotFound("transformer".to_string())))?;
 
-        let data_type = decoder_config
-            .first_attention()
-            .ok_or(Error::Classifier(ClassifierError::NonAttentionMixer))?
-            .qkv_projection_config
-            .activation_precision()
-            .into();
+        let output_norm_tree = transformer_tree
+            .subtree("output_norm")
+            .map_err(|_| Error::Classifier(ClassifierError::WeightSubtreeNotFound("output_norm".to_string())))?;
 
         let embed = Embedding::new(
             context.as_ref(),
@@ -79,21 +87,25 @@ impl<B: Backend> ClassifierContext<B> {
             decoder_config.transformer_config.model_dim as u32,
             &decoder_config.embedding_config,
             &root_loader_view.subtree("embedding").expect("Failed to get embedding subtree"),
+            &model_shape,
+            &forward_pass_config.embedding_forward_pass_config,
         )
         .expect("Failed to create embedding");
 
         let rope = Rc::new(
-            Rope::<B>::new(context.as_ref(), data_type)
+            Rope::<B>::new(
+                context.as_ref(),
+                activation_data_type,
+                forward_pass_config.transformer_forward_pass_config.mixer_forward_pass_config.rope_data_type,
+            )
                 .map_err(|e| Error::Classifier(ClassifierError::KernelCreationFailed(format!("RoPE: {:?}", e))))?,
         );
         let qk_unpack = Rc::new(
-            QkUnpack::<B>::new(context.as_ref(), data_type)
+            QkUnpack::<B>::new(context.as_ref(), activation_data_type)
                 .map_err(|e| Error::Classifier(ClassifierError::KernelCreationFailed(format!("QkUnpack: {:?}", e))))?,
         );
 
-        let layers = model_metadata
-            .model_config
-            .model_config
+        let layers = classifier_config
             .transformer_config
             .layer_configs
             .iter()
@@ -107,25 +119,27 @@ impl<B: Backend> ClassifierContext<B> {
 
                 Ok(ClassifierLayer::new(
                     context.as_ref(),
-                    &model_metadata.model_config.model_config.transformer_config,
+                    &classifier_config.transformer_config,
                     layer_config,
                     layer_index,
                     &layer_tree,
                     rope.clone(),
                     qk_unpack.clone(),
+                    &forward_pass_config.transformer_forward_pass_config,
+                    activation_data_type,
+                    model_shape.weights_data_type,
                 ))
             })
             .collect::<Result<Vec<_>, ClassifierError>>()
             .map_err(Error::Classifier)?
             .into_boxed_slice();
 
-        let output_norm_tree = transformer_tree
-            .subtree("output_norm")
-            .map_err(|_| Error::Classifier(ClassifierError::WeightSubtreeNotFound("output_norm".to_string())))?;
         let output_norm = Normalization::new(
             context.as_ref(),
-            data_type,
-            model_metadata.model_config.model_config.transformer_config.output_norm_config.clone(),
+            activation_data_type,
+            classifier_config.transformer_config.model_dim,
+            &forward_pass_config.normalization_forward_pass_config,
+            classifier_config.transformer_config.output_norm_config.clone(),
             &output_norm_tree,
         )
         .map_err(|e| Error::Classifier(ClassifierError::KernelCreationFailed(format!("output norm: {:?}", e))))?;
@@ -135,29 +149,30 @@ impl<B: Backend> ClassifierContext<B> {
             .map_err(|_| Error::Classifier(ClassifierError::WeightSubtreeNotFound("embedding_norm".to_string())))?;
         let embedding_norm = Normalization::new(
             context.as_ref(),
-            data_type,
-            model_metadata.model_config.model_config.embedding_norm_config.clone(),
+            activation_data_type,
+            classifier_config.transformer_config.model_dim,
+            &forward_pass_config.normalization_forward_pass_config,
+            classifier_config.embedding_norm_config.clone(),
             &embedding_norm_tree,
         )
         .map_err(|e| Error::Classifier(ClassifierError::KernelCreationFailed(format!("embedding norm: {:?}", e))))?;
 
-        let model_dim = model_metadata.model_config.model_config.model_dim;
-        let num_labels = model_metadata.model_config.model_config.num_labels;
-        let prediction_head_config = &model_metadata.model_config.model_config.prediction_head_config;
+        let model_dim = classifier_config.model_dim;
+        let num_labels = classifier_config.num_labels;
+        let prediction_head_config = &classifier_config.prediction_head_config;
         let prediction_head_tree = root_loader_view
             .subtree("prediction_head")
             .map_err(|_| Error::Classifier(ClassifierError::WeightSubtreeNotFound("prediction_head".to_string())))?;
 
-        let prediction_head_data_type: DataType = prediction_head_config.dense_config.activation_precision().into();
-
         let prediction_head_dense_tree = prediction_head_tree.subtree("dense").map_err(|_| {
             Error::Classifier(ClassifierError::WeightSubtreeNotFound("prediction_head.dense".to_string()))
         })?;
+        let prediction_head_data_type = model_shape.weights_data_type;
         let prediction_head_dense = <dyn Linear<B>>::new::<1>(
-            &prediction_head_config.dense_config,
             model_dim,
             [model_dim],
             context.as_ref(),
+            prediction_head_data_type,
             &prediction_head_dense_tree,
         )
         .map_err(|e| {
@@ -170,6 +185,8 @@ impl<B: Backend> ClassifierContext<B> {
         let prediction_head_norm = Normalization::new(
             context.as_ref(),
             prediction_head_data_type,
+            model_dim,
+            &forward_pass_config.normalization_forward_pass_config,
             prediction_head_config.normalization_config.clone(),
             &prediction_head_norm_tree,
         )
@@ -180,21 +197,25 @@ impl<B: Backend> ClassifierContext<B> {
         let prediction_head_readout_tree = prediction_head_tree.subtree("readout").map_err(|_| {
             Error::Classifier(ClassifierError::WeightSubtreeNotFound("prediction_head.readout".to_string()))
         })?;
+        let logits_data_type = model_shape.weights_data_type;
         let prediction_head_final_linear = <dyn Linear<B>>::new::<1>(
-            &prediction_head_config.readout_config,
             model_dim,
             [num_labels],
             context.as_ref(),
+            logits_data_type,
             &prediction_head_readout_tree,
         )
         .map_err(|e| {
-            Error::Classifier(ClassifierError::KernelCreationFailed(format!("prediction head readout: {:?}", e)))
+            Error::Classifier(ClassifierError::KernelCreationFailed(format!(
+                "prediction head readout: {:?}",
+                e
+            )))
         })?;
 
         let pooling = Pooling::<B>::new(
             context.as_ref(),
-            data_type,
-            model_metadata.model_config.model_config.classifier_pooling.clone(),
+            activation_data_type,
+            classifier_config.classifier_pooling.clone(),
             model_dim,
         )
         .map_err(|e| {
@@ -205,7 +226,7 @@ impl<B: Backend> ClassifierContext<B> {
         let prediction_head = ClassifierPredictionHead::new(
             context.as_ref(),
             prediction_head_dense,
-            prediction_head_config.activation.clone(),
+            prediction_head_config.activation.clone().into(),
             prediction_head_data_type,
             prediction_head_norm,
             prediction_head_final_linear,
@@ -218,7 +239,9 @@ impl<B: Backend> ClassifierContext<B> {
         Ok(Self {
             context,
             shared_buffers,
-            model_config: model_metadata.model_config.clone(),
+            model_config: model_config.clone(),
+            #[cfg(feature = "tracing")]
+            forward_pass_config,
             #[cfg(feature = "tracing")]
             model_shape,
             embed,
@@ -227,6 +250,7 @@ impl<B: Backend> ClassifierContext<B> {
             output_norm,
             pooling,
             prediction_head,
+            logits_data_type,
         })
     }
 }

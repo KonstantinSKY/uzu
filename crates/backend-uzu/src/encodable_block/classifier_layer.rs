@@ -3,10 +3,11 @@ use std::rc::Rc;
 use crate::{
     DataType,
     backends::common::{Allocation, AsBufferRangeRef, Backend, Encoder, Kernels, kernel::TensorAddSwapKernel},
-    config::{TransformerConfig, TransformerLayerConfig},
+    config::{transformer::TransformerConfig, transformer_layer::TransformerLayerConfig},
     encodable_block::{
         Attention, AttentionArguments, LayerArguments, Linear, Mlp, Normalization, QKVNorm, QkUnpack, Rope,
     },
+    forward_pass::config::transformer::TransformerForwardPassConfig,
     parameters::ParameterTree,
 };
 
@@ -39,14 +40,18 @@ impl<B: Backend> ClassifierLayer<B> {
         layer_loader: &ParameterTree<B::Context>,
         rope: Rc<Rope<B>>,
         qk_unpack: Rc<QkUnpack<B>>,
+        forward_pass_config: &TransformerForwardPassConfig,
+        intermediate_data_type: DataType,
+        weights_data_type: DataType,
     ) -> Self {
         let attention_config = layer_config.mixer_config.as_attention().expect("Classifier layers must use attention");
-        let intermediate_data_type: DataType = attention_config.qkv_projection_config.activation_precision().into();
 
         let pre_attention_norm = layer_config.pre_mixer_norm_config.as_ref().map(|norm_config| {
             Normalization::new(
                 context,
                 intermediate_data_type,
+                transformer_config.model_dim,
+                &forward_pass_config.normalization_forward_pass_config,
                 norm_config.clone(),
                 &layer_loader.subtree("pre_mixer_norm").unwrap(),
             )
@@ -54,7 +59,6 @@ impl<B: Backend> ClassifierLayer<B> {
         });
 
         let qkv_projection = <dyn Linear<B>>::new(
-            &attention_config.qkv_projection_config,
             transformer_config.model_dim,
             [
                 attention_config.num_heads * attention_config.head_dim,
@@ -62,6 +66,7 @@ impl<B: Backend> ClassifierLayer<B> {
                 attention_config.num_groups * attention_config.head_dim,
             ],
             context,
+            weights_data_type,
             &layer_loader.subtree("mixer.qkv_projection").unwrap(),
         )
         .expect("Failed to create qkv projection");
@@ -74,6 +79,7 @@ impl<B: Backend> ClassifierLayer<B> {
             match QKVNorm::new(
                 context,
                 intermediate_data_type,
+                &forward_pass_config.mixer_forward_pass_config.normalization_forward_pass_config,
                 attention_config.query_norm_config.clone(),
                 attention_config.key_norm_config.clone(),
                 value_norm_config,
@@ -90,10 +96,10 @@ impl<B: Backend> ClassifierLayer<B> {
         };
 
         let out_projection = <dyn Linear<B>>::new(
-            &attention_config.out_projection_config,
             attention_config.num_heads * attention_config.head_dim,
             [transformer_config.model_dim],
             context,
+            weights_data_type,
             &layer_loader.subtree("mixer.out_projection").unwrap(),
         )
         .expect("Failed to create out projection");
@@ -102,6 +108,8 @@ impl<B: Backend> ClassifierLayer<B> {
             Normalization::new(
                 context,
                 intermediate_data_type,
+                transformer_config.model_dim,
+                &forward_pass_config.normalization_forward_pass_config,
                 norm_config.clone(),
                 &layer_loader.subtree("post_mixer_norm").unwrap(),
             )
@@ -114,6 +122,8 @@ impl<B: Backend> ClassifierLayer<B> {
         let pre_mlp_norm = Normalization::new(
             context,
             intermediate_data_type,
+            transformer_config.model_dim,
+            &forward_pass_config.normalization_forward_pass_config,
             layer_config.pre_mlp_norm_config.clone(),
             &layer_loader.subtree("pre_mlp_norm").unwrap(),
         )
@@ -125,6 +135,8 @@ impl<B: Backend> ClassifierLayer<B> {
             layer_config.hidden_dim.unwrap_or(transformer_config.hidden_dim),
             context,
             &layer_loader.subtree("mlp").unwrap(),
+            intermediate_data_type,
+            weights_data_type,
         )
         .expect("Failed to create mlp block");
 
@@ -134,6 +146,8 @@ impl<B: Backend> ClassifierLayer<B> {
             Normalization::new(
                 context,
                 intermediate_data_type,
+                transformer_config.model_dim,
+                &forward_pass_config.normalization_forward_pass_config,
                 norm_config.clone(),
                 &layer_loader.subtree("post_mlp_norm").unwrap(),
             )

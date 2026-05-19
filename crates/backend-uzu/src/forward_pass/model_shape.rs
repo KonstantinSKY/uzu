@@ -1,12 +1,11 @@
 use crate::{
     DataType,
-    config::{DecoderConfig, MLPConfig, MixerConfig},
+    config::{decoder::DecoderConfig, token_mixer::AnyTokenMixerConfig},
 };
 
 #[derive(Debug, Clone)]
 pub struct ModelShape {
-    activation_type: DataType,
-    kv_cache_type: DataType,
+    pub weights_data_type: DataType,
 
     vocabulary_size: usize,
     model_dim: usize,
@@ -14,7 +13,7 @@ pub struct ModelShape {
 
     num_groups: usize,
     pub num_layers: usize,
-    layer_mixers: Box<[MixerConfig]>,
+    layer_mixers: Box<[AnyTokenMixerConfig]>,
     kv_source_layers: Box<[Option<usize>]>,
 }
 
@@ -31,17 +30,11 @@ impl ModelShape {
             assert_eq!(attn.num_groups, num_groups, "attention layers must share num_groups");
         }
 
-        let activation_type: DataType = match &layer_configs[0].mlp_config {
-            MLPConfig::Dense(d) => d.linear_config.activation_precision().into(),
-            MLPConfig::MixtureOfExperts(m) => m.expert_config.linear_config.activation_precision().into(),
-        };
-
-        let layer_mixers: Box<[MixerConfig]> = layer_configs.iter().map(|l| l.mixer_config.clone()).collect();
-        let kv_source_layers: Box<[Option<usize>]> = layer_configs.iter().map(|l| l.kv_source_layer).collect();
+        let layer_mixers: Box<[AnyTokenMixerConfig]> = layer_configs.iter().map(|l| l.mixer_config.clone()).collect();
+        let kv_source_layers: Box<[Option<usize>]> = layer_configs.iter().map(|l| l.kv_source_layer_index).collect();
 
         Self {
-            activation_type,
-            kv_cache_type: activation_type,
+            weights_data_type: DataType::BF16,
             vocabulary_size: decoder_config.vocab_size,
             model_dim: tf.model_dim,
             context_length: tf.context_length,
@@ -50,14 +43,6 @@ impl ModelShape {
             layer_mixers,
             kv_source_layers,
         }
-    }
-
-    pub fn activation_data_type(&self) -> DataType {
-        self.activation_type
-    }
-
-    pub fn kv_cache_data_type(&self) -> DataType {
-        self.kv_cache_type
     }
 
     pub fn num_groups(&self) -> usize {
@@ -72,7 +57,7 @@ impl ModelShape {
         &self.kv_source_layers
     }
 
-    pub fn layer_mixers(&self) -> &[MixerConfig] {
+    pub fn layer_mixers(&self) -> &[AnyTokenMixerConfig] {
         &self.layer_mixers
     }
 
